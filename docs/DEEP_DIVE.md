@@ -121,8 +121,8 @@ free, fast on Apple Silicon, and a CNCF project.
 Kernel". `dnf` package manager, systemd, SELinux, firewalld.
 
 **Why.** Oracle Database Free 26ai on aarch64 is supported on OL8 and OL9 only, and the
-preinstall RPM lives in Oracle's yum repos. OL9 was picked over OL8 because the Oracle
-docs set the aarch64 floor at OL9.4/UEK7 for 26ai, OL9 has a longer life, and the lab
+preinstall RPM lives in Oracle's yum repos. The Oracle docs' aarch64 minimums for 26ai are
+OL8.6/UEK7 and OL9.4/UEK7; OL9 was picked over OL8 because it has a longer life and the lab
 image for OL9 ships with Python 3.9 (fine for Ansible).
 
 **Page size caveat.** Apple Silicon only supports 4 KiB and 16 KiB page granules; a 64 KiB
@@ -202,19 +202,22 @@ parameter file (`/etc/sysconfig/oracle-ai-database-preinstall-26ai/*.param`) tha
 3. writes `/etc/security/limits.d/oracle-ai-database-preinstall-26ai.conf` for the `oracle`
    user (nofile 1024/65536, nproc 16384, stack 10240/32768 KB, memlock = the larger of
    128 GiB and 90 % of RAM, data unlimited);
-4. enables a *firstboot* systemd service that on the next boot would run `grubby` to add
-   `numa=off transparent_hugepage=madvise` to the kernel command line;
+4. adds `numa=off transparent_hugepage=madvise` to the kernel command line with `grubby`,
+   writes `madvise` to the THP sysfs files right away, and enables a *firstboot* systemd
+   service that would re-apply those boot arguments on the next boot;
 5. logs everything to `/var/log/oracle-ai-database-preinstall-26ai/results/orakernel.log`.
 
 **Why.** It is Oracle's supported way to prepare an OL host; the values are the ones in the
 installation guide. The lab installs it and then *asserts* the result rather than
 re-declaring the same numbers, so the RPM stays the source of truth and drift is caught.
 
-**What the lab overrides.** Item 4: the firstboot hook is disabled through its own switch
-(`RUN_ORACLE_AI_DATABASE_PREINSTALL_26AI=NO`) because the lab wants
-`transparent_hugepage=never`, applied explicitly by Ansible, not `madvise` applied by a
-hidden hook on a later boot (and `numa=off` is meaningless on a single-NUMA-node VM; on a
-real multi-socket host you would decide it consciously). The Pythian ORA-00600 issue on
+**What the lab overrides.** Item 4: the role replaces `transparent_hugepage=madvise` with
+`never` (`grubby --args` overwrites an argument of the same name, and the sysfs files are
+rewritten), and disables the firstboot hook through its own switch
+(`RUN_ORACLE_AI_DATABASE_PREINSTALL_26AI=NO`) so it cannot put `madvise` back on a later
+boot; the THP setting is applied explicitly by Ansible, not by a hidden hook (`numa=off` is
+left in place; it is meaningless on a single-NUMA-node VM, and on a real multi-socket host
+you would decide it consciously). The Pythian ORA-00600 issue on
 23ai/ARM (missing `libgfortran`) is fixed in this preinstall release, which lists
 `libgfortran >= 11.5.0` as a dependency; the lab verified that before relying on it.
 
@@ -228,7 +231,8 @@ listener) and `dbca` (creates the database) non-interactively; `systemctl start|
 oracle-free-26ai` works because systemd generates a unit from the init script.
 
 **Limits that shape the lab.** 2 CPU threads, 2 GB of RAM for the instance (SGA + PGA), 12 GB
-of user data, one instance per host, no RAC, no Data Guard, no RMAN recovery catalog.
+of user data, one installation per host, no RAC, no Data Guard. (RMAN here runs without a
+recovery catalog, control file only; that is a lab choice, not an edition limit.)
 Hence `oracle_sga_mb: 1536` and `oracle_pga_mb: 384` (1.875 GB, under the cap), and the
 "production differences" section for everything the edition cannot show.
 
@@ -252,7 +256,9 @@ tablespace, PDB or database granularity.
 
 **Why RMAN and not filesystem/VM snapshots.** A snapshot of a running database is a
 crash-consistent image of blocks that Oracle may be in the middle of writing; it is
-restorable only with Oracle's own recovery and gives no point-in-time choice. RMAN backups
+restorable only with Oracle's own recovery, and recovering it to a point in time still means
+Oracle applying archived redo on top (`RECOVER ... SNAPSHOT TIME`, on storage that meets
+Oracle's snapshot requirements), at whole-snapshot granularity. RMAN backups
 are application-consistent by construction, incremental, verifiable (`VALIDATE`), and
 RMAN decides what is obsolete. Snapshots complement RMAN (section 6); they do not replace it.
 
@@ -348,7 +354,7 @@ second run reports `changed=0` (the evidence file shows the recap).
 
 Packages (`chrony firewalld lvm2 xfsprogs dnf-utils policycoreutils-python-utils tar unzip bc`),
 `chronyd` and `firewalld` enabled and started, three TCP ports opened permanently *and*
-immediately, SELinux asserted enforcing/targeted, journald made persistent, a log directory
+immediately, SELinux kept enforcing/targeted, journald made persistent, a log directory
 for the lab. Nothing Oracle-specific yet; this is what every server should look like.
 
 ### 3.2 `os_prereqs`: the memory and kernel layer
@@ -407,9 +413,9 @@ allocates the SGA as several shared memory segments and each needs whole pages, 
 small extra segment or two appears at startup. With the instance up the evidence shows
 784 total, 25 free, 8 reserved: 767 pages (1534 MiB) allocated or reserved, matching the
 four System V segments `ipcs -m` lists (1,608,515,584 bytes) for an instance whose
-`v$sgainfo` "Maximum SGA Size" is 1,603,392,144 bytes (1529 MiB; `sga_max_size` is rounded
-to 16 MiB granules and the fixed SGA is carved out, so the built SGA is a little smaller than
-the parameter).
+`v$sgainfo` "Maximum SGA Size" is 1,603,392,144 bytes (1529 MiB; the SGA the instance
+builds comes out a little under the `sga_max_size` parameter, which is why the verification
+compares against this number rather than the parameter).
 
 `ansible.posix.sysctl` writes `vm.nr_hugepages = 784` to
 `/etc/sysctl.d/98-oracle-ops-lab-hugepages.conf` and applies it immediately. Then the role
@@ -440,7 +446,9 @@ Three ways to disable: a tuned profile (`tuned` is not installed on this image, 
 applies late in boot and can be overridden by a profile switch), a systemd unit that writes
 `/sys/kernel/mm/transparent_hugepage/enabled` (works, but is one more unit), or the kernel
 command line `transparent_hugepage=never` (applied by the kernel itself before any
-userspace runs, cannot be undone by a service, survives tuned changes). The lab uses the
+userspace runs, so no process can get a THP before it is in force, and it does not depend on
+a unit running; it is still a runtime sysfs value that a tuned profile or any root process
+could change later, which is why the role asserts the live value too). The lab uses the
 kernel argument, applied with `grubby --update-kernel=ALL`, and writes the sysfs files too
 so the running kernel matches without waiting:
 
@@ -467,7 +475,8 @@ not flip, so the role also installs `/etc/tmpfiles.d/oracle-ops-lab-thp.conf`
 applies at boot, and asserts both files. Note the preinstall RPM
 would have chosen `madvise` (only processes that ask get THP; Oracle does not ask, so
 for Oracle it is nearly equivalent to `never`), but `never` is what Oracle's note says and
-it also stops `khugepaged` from scanning other processes.
+it also stops software that does ask (JVMs, jemalloc-based tools) from getting THP on the
+same host.
 
 #### The kernel parameters the preinstall RPM sets, and what each means
 
@@ -487,8 +496,9 @@ it also stops `khugepaged` from scanning other processes.
 | `net.ipv4.conf.*.rp_filter` | 2 | loose reverse-path filtering, needed when a host has several interfaces (RAC interconnect); harmless here. |
 | `vm.hugetlb_shm_group` | 54321 (oinstall) | only this group may create huge-page-backed shared memory. Without it, `use_large_pages` silently fails. |
 
-The role asserts all of these with `sysctl -n` after the RPM runs (section 4 shows the
-task). They are *minimums*: the RPM only raises values, never lowers them.
+The role asserts all of these except `rp_filter` and `kernel.panic` with `sysctl -n` after
+the RPM runs (section 4 shows the task). They are *minimums*: the RPM only raises values,
+never lowers them.
 
 #### Limits (`/etc/security/limits.d/oracle-ai-database-preinstall-26ai.conf`)
 
@@ -599,7 +609,7 @@ blacklist for local disks). Section 6 covers it in context.
    sysv-generated unit cannot start before the volumes are mounted (otherwise a slow disk
    at boot means a database that starts without its files), plus longer start/stop
    timeouts. Then `enable` + `start`.
-6. **Parameters.** Read nine parameters from `v$parameter`, compare with the desired set
+6. **Parameters.** Read eight parameters from `v$parameter`, compare with the desired set
    (`sga_max_size`/`sga_target` 1536M, `pga_aggregate_target` 384M, `memory_target` and
    `memory_max_target` 0, `use_large_pages=ONLY`, FRA location and 15 GiB quota), write
    only if different (`scope=spfile`), reset any parameter the release flags as deprecated
@@ -614,8 +624,8 @@ blacklist for local disks). Section 6 covers it in context.
 9. **Verify.** CDB and PDB `READ WRITE`, `use_large_pages=ONLY`, `ARCHIVELOG`, and
    `(HugePages_Total - HugePages_Free + HugePages_Rsvd) * Hugepagesize >=` the instance's
    "Maximum SGA Size" from `v$sgainfo` (the SGA the instance actually built; comparing
-   against `sga_max_size` itself fails by two pages because of granule rounding, which is
-   how this assertion was found to need the real number).
+   against `sga_max_size` itself fails here by one page, 767 pages in use against the 768
+   that 1536 MiB would need, which is how this assertion was found to need the real number).
 
 #### `use_large_pages=ONLY`: the trade-off
 
@@ -688,8 +698,8 @@ an image, the wrapper cannot write the metric, the exporter stopped reading the 
 `time() - last_success_timestamp > 26h` catches every one of them with one expression,
 because the only way to make it quiet is to actually produce a good backup. `BackupFailed`
 (`last_status == 0`) is the fast, specific signal that explains *why*; `BackupMetricMissing`
-(`absent(...)`) covers the plumbing. The 26 h threshold is one hour above the daily
-schedule plus jitter.
+(`absent(...)`) covers the plumbing. The 26 h threshold is two hours above the daily
+schedule, covering the 15-minute jitter and the run itself.
 
 ### 3.6 `monitoring`: two exporters
 
@@ -736,7 +746,8 @@ The vendor defaults add `oracledb_up`, sessions by status/type, resource limits
 | `HugePagesPoolMissing` | `node_memory_HugePages_Total == 0` | pool lost; next restart will fail |
 | `NotInArchivelogMode` | `oracledb_ops_db_archivelog == 0` | point-in-time recovery impossible |
 
-Each carries a `runbook` annotation pointing at `docs/runbooks/`. The unit tests in
+All but `NotInArchivelogMode` carry a `runbook` annotation pointing at `docs/runbooks/`.
+The unit tests in
 `tests/alerts_test.yml` feed synthetic series and assert exactly which alerts exist at
 given times, including the negative cases (25 h: no alert; TEMP at 99 %: no alert; 770 of
 784 pages used: no alert).
@@ -888,7 +899,9 @@ passwd entry is the primary GID, so the `hugetlb_shm_group` check is tied to the
 `lsblk -n` (no header) `-d` (the device only, not children) `-o` (columns) `-b` (bytes).
 A blank disk has an empty FSTYPE; after the first run it reads `LVM2_member`, and a second
 block then checks `pvs -o vg_name` returns *our* VG. Anything else (an ext4 signature, a
-partition table, a foreign VG) stops the play before `pvcreate` can destroy it. The rest
+foreign VG) stops the play before `pvcreate` can destroy it; a disk carrying only a
+partition table is not caught by this check (`lsblk` reports that in `PTTYPE`, not
+`FSTYPE`), so that case is left to `pvcreate`'s own refusal. The rest
 of the file is the declarative chain `lvg -> lvol (100%VG) -> filesystem xfs -> file
 (mountpoint) -> mount (fstab + mounted) -> file (owner oracle)`.
 
@@ -1046,8 +1059,9 @@ run, which is the kind of thing unit tests are for.
 `needs-restarting -r` returns 1 only when the running kernel, systemd or core libraries
 differ from the installed ones. `failed_when` turns any other code into a failure, and the
 `block` keeps the three reboot steps together. Stopping the database *before* the reboot
-matters: a reboot's `SIGTERM` to the sysv unit does run `shutdown immediate`, but with a
-90-second default timeout and no visibility; doing it explicitly is both safer and logged.
+matters: a reboot would also stop the unit through the init script's `stop` (`shutdown
+immediate`, under the drop-in's `TimeoutStopSec=600`), but inside the shutdown sequence
+with no visibility from the play; doing it explicitly is both safer and logged.
 
 ---
 
@@ -1133,7 +1147,8 @@ the SGA in the pool.
 - **Memory reservation.** A VM backing its SGA with huge pages must have a full memory
   reservation (`Reserve all guest memory`) so the hypervisor never balloons or swaps the
   pages the guest has pinned; otherwise the guest thinks the SGA is locked while the host
-  is paging it. Reservation also lets the hypervisor back the VM with large pages itself.
+  is paging it. A reservation also keeps ESXi from breaking the 2 MiB host pages behind the
+  VM into small pages under memory pressure.
 - **vNUMA.** On a multi-socket host, a VM with more vCPUs than a physical NUMA node gets
   several virtual NUMA nodes; the guest kernel and Oracle see them. Size VMs to fit in one
   node where possible, keep vCPU count and memory aligned to the node, and revisit
@@ -1186,8 +1201,9 @@ change; the channel configuration does.
 Array or vSphere snapshots are fast to take and to roll back, and are the right tool for
 "before the patch" and for cloning test environments (with `ALTER DATABASE BEGIN/END
 BACKUP` or storage-integrated consistency). They are on the same array as the data, they
-are crash-consistent unless coordinated, and they cannot restore one datafile to a point
-in time. RMAN backups are the recoverability baseline; snapshots and replication reduce
+are crash-consistent unless coordinated, they restore at whole-snapshot granularity, and
+point-in-time recovery from one still means Oracle applying archived redo on top
+(`RECOVER ... SNAPSHOT TIME`). RMAN backups are the recoverability baseline; snapshots and replication reduce
 RTO for whole-system cases.
 
 ### Licensing considerations
@@ -1199,8 +1215,10 @@ DRS host affinity rules and why `use_large_pages`, `cpus` and vNUMA decisions ar
 the licence boundary in mind. Options (Partitioning, Diagnostics/Tuning Pack, Advanced
 Compression for RMAN compression levels beyond BASIC, Active Data Guard) are licensed
 separately; the lab deliberately uses only base features (uncompressed backup sets,
-`v$`/`cdb_` views, no AWR). Free edition has none of these concerns and none of these
-features.
+`v$`/`cdb_` views, no AWR) so nothing here depends on an option. Free edition has none of
+these concerns: it bundles most of the options (Partitioning, Advanced Compression, the
+Diagnostics and Tuning Packs, In-Memory) under its own free-use terms, and simply lacks
+RAC and Data Guard.
 
 ---
 

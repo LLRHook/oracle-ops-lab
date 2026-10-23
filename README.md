@@ -65,7 +65,7 @@ flowchart LR
 | Backup and recovery | RMAN incremental strategy on systemd timers; `RESTORE DATABASE VALIDATE`; a destructive lost-datafile drill that measures RTO and writes a report |
 | Observability of the Oracle tier | node_exporter + Oracle's metrics exporter, custom SQL metrics, Prometheus rules (`DatabaseDown`, `BackupTooOld`, `FRAAlmostFull`, `TablespaceAlmostFull`, `HugePagesNotInUse`, ...) with promtool unit tests in CI |
 | Patching | pre-checks (space, DB health, backup freshness), `dnf`, reboot only when `needs-restarting` says so, orderly DB stop/start, post-checks; `serial` for fleets |
-| Runbooks | `docs/runbooks/`: one per alert or operation |
+| Runbooks | `docs/runbooks/`: six runbooks covering the alerts (all but `NotInArchivelogMode`) and the patching operation |
 
 ## Quickstart
 
@@ -135,8 +135,8 @@ scripts/                      gen-secrets.sh, collect-evidence.sh
 - **Multipath is template-only.** A VM has one path to each virtual disk; `multipath.conf`
   is rendered only when `multipath_enabled: true` with real WWIDs.
 - **Oracle Database Free** limits CPU to 2 threads, memory to 2 GB and user data to 12 GB,
-  and has no RAC, Data Guard or RMAN catalog. The SGA is 1.5 GiB so that the huge page
-  work is real but small.
+  and has no RAC or Data Guard. RMAN here runs without a recovery catalog (control file
+  only), a lab choice. The SGA is 1.5 GiB so that the huge page work is real but small.
 - **Single node.** No standby, no replication; the restore drill is a single-datafile
   recovery, not a site failover.
 - **Secrets** are a generated, gitignored file, not a vault or secret store.
