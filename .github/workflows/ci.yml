@@ -27,15 +27,19 @@ jobs:
       - name: ansible-lint
         run: ANSIBLE_COLLECTIONS_PATH=ansible/collections .venv/bin/ansible-lint --offline
 
+  # promtool runs from the official image via `docker run`, the same way `make test` does.
+  # (Running the job inside the busybox-based image breaks actions/checkout, which needs
+  # the runner's Node.js and its shared libraries.)
   promtool:
     name: promtool check + unit tests
     runs-on: ubuntu-latest
-    container:
-      image: prom/prometheus:v3.15.1
-      options: --entrypoint ""
+    env:
+      PROMTOOL: >-
+        docker run --rm -v ${{ github.workspace }}/monitoring/prometheus:/work:ro -w /work
+        --entrypoint promtool prom/prometheus:v3.15.1
     steps:
       - uses: actions/checkout@v5
       - name: Check rules
-        run: promtool check rules monitoring/prometheus/alerts.yml
+        run: $PROMTOOL check rules alerts.yml
       - name: Unit tests
-        run: cd monitoring/prometheus && promtool test rules tests/alerts_test.yml
+        run: $PROMTOOL test rules tests/alerts_test.yml
