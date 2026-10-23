@@ -18,11 +18,15 @@ chmod 700 ansible/secrets
 
 # Oracle wants >= 8 chars with upper, lower and a digit. Keep to alphanumerics so the
 # value never needs shell or SQL quoting. 20 chars from /dev/urandom ~ 119 bits.
+# Read a fixed number of random bytes first, then filter: `tr </dev/urandom | head -c`
+# would leave tr writing into a closed pipe once head exits, and under `pipefail` that
+# SIGPIPE (exit 141) fails the script.
 gen() {
   local p
   while :; do
-    p=$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 20)
-    [[ "$p" =~ [A-Z] && "$p" =~ [a-z] && "$p" =~ [0-9] ]] && { printf '%s' "$p"; return; }
+    p=$(head -c 512 /dev/urandom | LC_ALL=C tr -dc 'A-Za-z0-9')
+    p=${p:0:20}
+    [[ ${#p} -eq 20 && "$p" =~ [A-Z] && "$p" =~ [a-z] && "$p" =~ [0-9] ]] && { printf '%s' "$p"; return; }
   done
 }
 
