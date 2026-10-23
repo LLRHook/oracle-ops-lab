@@ -1,0 +1,12 @@
+# {{ ansible_managed }}
+[Unit]
+Description=Schedule RMAN {{ item.level }} backup of {{ oracle_sid }}
+
+[Timer]
+OnCalendar={{ item.oncalendar }}
+Persistent=true
+RandomizedDelaySec={{ item.jitter }}
+Unit=oracle-rman-backup@{{ item.level }}.service
+
+[Install]
+WantedBy=timers.target

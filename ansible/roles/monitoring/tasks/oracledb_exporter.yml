@@ -1,0 +1,90 @@
+---
+- name: Download the Oracle metrics exporter (glibc-2.28 build for OL9)
+  ansible.builtin.get_url:
+    url: "{{ oracledb_exporter_url }}"
+    dest: "/var/tmp/oracledb_exporter-{{ oracledb_exporter_version }}.linux-arm64-glibc-2.28.tar.gz"
+    checksum: "sha256:{{ oracledb_exporter_sha256 }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Unpack the exporter under /opt
+  ansible.builtin.unarchive:
+    src: "/var/tmp/oracledb_exporter-{{ oracledb_exporter_version }}.linux-arm64-glibc-2.28.tar.gz"
+    dest: /opt
+    remote_src: true
+    owner: root
+    group: root
+    creates: "/opt/oracledb_exporter-{{ oracledb_exporter_version }}.linux-arm64/oracledb_exporter"
+
+- name: Link the exporter binary into PATH
+  ansible.builtin.file:
+    src: "/opt/oracledb_exporter-{{ oracledb_exporter_version }}.linux-arm64/oracledb_exporter"
+    dest: /usr/local/bin/oracledb_exporter
+    state: link
+  notify: Restart oracledb_exporter
+
+- name: Create the exporter configuration directory
+  ansible.builtin.file:
+    path: "{{ oracledb_exporter_dir }}"
+    state: directory
+    owner: root
+    group: "{{ oracle_group }}"
+    mode: "0750"
+
+- name: Download the vendor default metrics file for this exporter version
+  ansible.builtin.get_url:
+    url: "{{ oracledb_exporter_default_metrics_url }}"
+    dest: "{{ oracledb_exporter_dir }}/default-metrics.toml"
+    checksum: "sha256:{{ oracledb_exporter_default_metrics_sha256 }}"
+    owner: root
+    group: "{{ oracle_group }}"
+    mode: "0640"
+  notify: Restart oracledb_exporter
+
+- name: Render the custom metrics
+  ansible.builtin.template:
+    src: custom-metrics.toml.j2
+    dest: "{{ oracledb_exporter_dir }}/custom-metrics.toml"
+    owner: root
+    group: "{{ oracle_group }}"
+    mode: "0640"
+  notify: Restart oracledb_exporter
+
+- name: Render the exporter configuration
+  ansible.builtin.template:
+    src: config.yaml.j2
+    dest: "{{ oracledb_exporter_dir }}/config.yaml"
+    owner: root
+    group: "{{ oracle_group }}"
+    mode: "0640"
+  notify: Restart oracledb_exporter
+
+- name: Write the credential environment file (0600, oracle)
+  ansible.builtin.copy:
+    dest: "{{ oracledb_exporter_dir }}/env"
+    content: "DB_PASSWORD={{ oracle_exporter_password }}\n"
+    owner: "{{ oracle_user }}"
+    group: "{{ oracle_group }}"
+    mode: "0600"
+  no_log: true
+  notify: Restart oracledb_exporter
+
+- name: Install the exporter unit
+  ansible.builtin.template:
+    src: oracledb_exporter.service.j2
+    dest: /etc/systemd/system/oracledb_exporter.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart oracledb_exporter
+
+- name: Enable and start the exporter
+  ansible.builtin.systemd_service:
+    name: oracledb_exporter
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Flush handlers so restarts happen before verification
+  ansible.builtin.meta: flush_handlers

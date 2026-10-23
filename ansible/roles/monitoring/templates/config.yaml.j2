@@ -1,0 +1,26 @@
+# {{ ansible_managed }}
+# Oracle Database metrics exporter configuration. The password comes from the
+# environment file (DB_PASSWORD), never from this file.
+databases:
+  default:
+    username: {{ oracledb_exporter_user }}
+    password: ${DB_PASSWORD}
+    # CDB root: the custom metrics use CDB_* / V$ views to cover every container.
+    url: localhost:{{ oracle_listener_port }}/{{ oracle_sid }}
+    queryTimeout: 5
+    connMaxLifetime: 30m
+    maxOpenConns: 2
+    maxIdleConns: 2
+
+metrics:
+  default: {{ oracledb_exporter_dir }}/default-metrics.toml
+  custom:
+    - {{ oracledb_exporter_dir }}/custom-metrics.toml
+
+log:
+  level: info
+  format: logfmt
+  disable: 1
+
+web:
+  listenAddresses: [":{{ oracledb_exporter_port }}"]

@@ -1,0 +1,69 @@
+# {{ ansible_managed }}
+# Lab-specific metrics for the Oracle tier. Connected to the CDB root, so CDB_ views
+# span every container and the pdb label tells them apart.
+
+[[metric]]
+context = "ops_tablespace"
+labels = [ "pdb", "tablespace" ]
+metricsdesc = { used_percent = "Percent of the tablespace's maximum size in use (autoextend-aware).", used_bytes = "Bytes used.", max_bytes = "Maximum size in bytes the tablespace can grow to." }
+request = '''
+select c.name as pdb, m.tablespace_name as tablespace,
+       round(m.used_percent, 2) as used_percent,
+       m.used_space * t.block_size as used_bytes,
+       m.tablespace_size * t.block_size as max_bytes
+from cdb_tablespace_usage_metrics m
+join cdb_tablespaces t on t.con_id = m.con_id and t.tablespace_name = m.tablespace_name
+join v$containers c on c.con_id = m.con_id
+'''
+
+[[metric]]
+context = "ops_fra"
+labels = [ "name" ]
+metricsdesc = { limit_bytes = "db_recovery_file_dest_size.", used_bytes = "Bytes used in the FRA.", reclaimable_bytes = "Bytes Oracle may delete on demand (obsolete / already backed up).", used_percent_net = "Used minus reclaimable as a percent of the limit: the number that matters.", files = "Number of files in the FRA." }
+request = '''
+select name, space_limit as limit_bytes, space_used as used_bytes,
+       space_reclaimable as reclaimable_bytes,
+       round((space_used - space_reclaimable) / space_limit * 100, 2) as used_percent_net,
+       number_of_files as files
+from v$recovery_file_dest
+'''
+
+[[metric]]
+context = "ops_sga"
+metricsdesc = { max_bytes = "Maximum SGA size (what must fit in huge pages with use_large_pages=ONLY).", large_pages_only = "1 when use_large_pages=ONLY, else 0." }
+request = '''
+select (select bytes from v$sgainfo where name = 'Maximum SGA Size') as max_bytes,
+       (select case when value = 'ONLY' then 1 else 0 end from v$parameter where name = 'use_large_pages') as large_pages_only
+from dual
+'''
+
+[[metric]]
+context = "ops_db"
+metricsdesc = { archivelog = "1 when the database runs in ARCHIVELOG mode.", open_rw = "1 when the CDB is open read write." }
+request = '''
+select case log_mode when 'ARCHIVELOG' then 1 else 0 end as archivelog,
+       case open_mode when 'READ WRITE' then 1 else 0 end as open_rw
+from v$database
+'''
+
+[[metric]]
+context = "ops_pdb"
+labels = [ "pdb" ]
+metricsdesc = { open = "1 when the PDB is open READ WRITE." }
+request = '''
+select name as pdb, case open_mode when 'READ WRITE' then 1 else 0 end as open
+from v$pdbs
+'''
+
+[[metric]]
+context = "ops_sessions"
+labels = [ "pdb" ]
+metricsdesc = { active = "Active user sessions.", total = "User sessions (any status)." }
+request = '''
+select nvl(c.name, 'CDB$ROOT') as pdb,
+       sum(case when s.status = 'ACTIVE' then 1 else 0 end) as active,
+       count(*) as total
+from v$session s left join v$containers c on c.con_id = s.con_id
+where s.type = 'USER'
+group by nvl(c.name, 'CDB$ROOT')
+'''

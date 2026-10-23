@@ -1,0 +1,12 @@
+---
+- name: Restart node_exporter
+  ansible.builtin.systemd_service:
+    name: node_exporter
+    state: restarted
+    daemon_reload: true
+
+- name: Restart oracledb_exporter
+  ansible.builtin.systemd_service:
+    name: oracledb_exporter
+    state: restarted
+    daemon_reload: true

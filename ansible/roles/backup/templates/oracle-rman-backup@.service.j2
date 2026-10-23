@@ -1,0 +1,16 @@
+# {{ ansible_managed }}
+[Unit]
+Description=RMAN backup (%i) of Oracle database {{ oracle_sid }}
+After={{ oracle_service }}.service
+Requires={{ oracle_service }}.service
+
+[Service]
+Type=oneshot
+User={{ oracle_user }}
+Group={{ oracle_group }}
+ExecStart=/usr/local/bin/oracle-rman-backup %i
+# A level 0 of a small database takes minutes; do not let a slow disk kill it.
+TimeoutStartSec=4h
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

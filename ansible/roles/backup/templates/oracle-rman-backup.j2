@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# {{ ansible_managed }}
+# oracle-rman-backup LEVEL   (level0 | level1 | archivelog)
+#
+# Runs the RMAN script for LEVEL, keeps a log per run, and publishes backup state for
+# Prometheus through node_exporter's textfile collector. All three levels write their
+# state to {{ backup_state_dir }} and the .prom file is re-rendered from the whole state
+# so a single file always carries one coherent set of series.
+set -uo pipefail
+level="${1:?usage: oracle-rman-backup level0|level1|archivelog}"
+case "$level" in level0|level1|archivelog) ;; *) echo "unknown level $level" >&2; exit 2 ;; esac
+
+export ORACLE_HOME={{ oracle_home }}
+export ORACLE_SID={{ oracle_sid }}
+export ORACLE_BASE={{ oracle_base }}
+export PATH="$ORACLE_HOME/bin:$PATH"
+export NLS_DATE_FORMAT='YYYY-MM-DD HH24:MI:SS'
+
+rman_dir={{ rman_script_dir }}
+log_dir={{ rman_log_dir }}
+state_dir={{ backup_state_dir }}
+prom_dir={{ node_exporter_textfile_dir }}
+prom_file="$prom_dir/oracle_rman_backup.prom"
+
+ts=$(date +%Y%m%d-%H%M%S)
+log="$log_dir/rman-$level-$ts.log"
+start=$(date +%s)
+
+rman target / cmdfile="$rman_dir/$level.rman" log="$log" >/dev/null 2>&1
+rc=$?
+# RMAN can exit 0 while still printing RMAN-/ORA- errors in some paths; treat any as failure.
+if grep -qE '^(RMAN|ORA)-[0-9]{5}' "$log"; then rc=1; fi
+end=$(date +%s)
+
+# --- state ---------------------------------------------------------------
+mkdir -p "$state_dir"
+prev_success=0
+if [[ -f "$state_dir/$level.env" ]]; then
+  # shellcheck disable=SC1090
+  . "$state_dir/$level.env"
+  prev_success=${last_success:-0}
+fi
+if [[ $rc -eq 0 ]]; then status=1; last_success=$end; else status=0; last_success=$prev_success; fi
+cat >"$state_dir/$level.env.tmp" <<STATE
+last_run=$end
+last_success=$last_success
+status=$status
+duration=$((end - start))
+STATE
+mv -f "$state_dir/$level.env.tmp" "$state_dir/$level.env"
+
+# --- render metrics ------------------------------------------------------
+{
+  echo "# HELP oracle_rman_backup_last_run_timestamp_seconds Unix time the last RMAN run of this level finished."
+  echo "# TYPE oracle_rman_backup_last_run_timestamp_seconds gauge"
+  echo "# HELP oracle_rman_backup_last_success_timestamp_seconds Unix time of the last *successful* RMAN run of this level."
+  echo "# TYPE oracle_rman_backup_last_success_timestamp_seconds gauge"
+  echo "# HELP oracle_rman_backup_last_status Result of the last run: 1 = success, 0 = failure."
+  echo "# TYPE oracle_rman_backup_last_status gauge"
+  echo "# HELP oracle_rman_backup_duration_seconds Wall-clock duration of the last run."
+  echo "# TYPE oracle_rman_backup_duration_seconds gauge"
+  for f in "$state_dir"/*.env; do
+    [[ -f "$f" ]] || continue
+    lvl=$(basename "$f" .env)
+    # shellcheck disable=SC1090
+    . "$f"
+    echo "oracle_rman_backup_last_run_timestamp_seconds{level=\"$lvl\",sid=\"$ORACLE_SID\"} $last_run"
+    echo "oracle_rman_backup_last_success_timestamp_seconds{level=\"$lvl\",sid=\"$ORACLE_SID\"} $last_success"
+    echo "oracle_rman_backup_last_status{level=\"$lvl\",sid=\"$ORACLE_SID\"} $status"
+    echo "oracle_rman_backup_duration_seconds{level=\"$lvl\",sid=\"$ORACLE_SID\"} $duration"
+  done
+} >"$prom_file.$$"
+mv -f "$prom_file.$$" "$prom_file"
+
+# keep the last 30 logs per level
+ls -1t "$log_dir"/rman-"$level"-*.log 2>/dev/null | tail -n +31 | xargs -r rm -f
+
+if [[ $rc -ne 0 ]]; then
+  echo "RMAN $level FAILED (rc=$rc); see $log" >&2
+  grep -E '^(RMAN|ORA)-' "$log" | head -20 >&2
+  exit 1
+fi
+echo "RMAN $level OK in $((end - start))s; log $log"

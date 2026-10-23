@@ -1,0 +1,106 @@
+---
+- name: Create RMAN script, log and state directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ oracle_user }}"
+    group: "{{ oracle_group }}"
+    mode: "0750"
+  loop:
+    - "{{ rman_script_dir }}"
+    - "{{ rman_log_dir }}"
+    - "{{ backup_state_dir }}"
+
+- name: Create the node_exporter textfile directory (oracle may write, node_exporter reads)
+  ansible.builtin.file:
+    path: "{{ node_exporter_textfile_dir }}"
+    state: directory
+    owner: root
+    group: "{{ oracle_group }}"
+    mode: "0775"
+
+- name: Render RMAN scripts
+  ansible.builtin.template:
+    src: "{{ item }}.rman.j2"
+    dest: "{{ rman_script_dir }}/{{ item }}.rman"
+    owner: "{{ oracle_user }}"
+    group: "{{ oracle_group }}"
+    mode: "0640"
+  loop: [configure, level0, level1, archivelog]
+
+- name: Install the backup wrapper
+  ansible.builtin.template:
+    src: oracle-rman-backup.j2
+    dest: /usr/local/bin/oracle-rman-backup
+    owner: root
+    group: "{{ oracle_group }}"
+    mode: "0755"
+
+- name: Read the persistent RMAN configuration stored in the control file
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail;
+      export ORACLE_HOME={{ oracle_home }} ORACLE_SID={{ oracle_sid }} PATH={{ oracle_home }}/bin:$PATH;
+      echo 'SHOW ALL;' | rman target / | grep '^CONFIGURE'
+  become: true
+  become_user: "{{ oracle_user }}"
+  register: backup_rman_show
+  changed_when: false
+
+# RMAN always reports "new RMAN configuration parameters are successfully stored", so the
+# only way to be idempotent is to compare SHOW ALL with the CONFIGURE lines we render.
+- name: Determine whether any CONFIGURE line in configure.rman is missing from SHOW ALL
+  ansible.builtin.set_fact:
+    backup_rman_missing: >-
+      {{ lookup('ansible.builtin.template', 'configure.rman.j2').splitlines()
+         | select('match', '^CONFIGURE ')
+         | map('regex_replace', '\\s+', ' ')
+         | reject('in', backup_rman_show.stdout_lines | map('regex_replace', ' # default$', '') | map('regex_replace', '\\s+', ' ') | list)
+         | list }}
+
+- name: Apply persistent RMAN configuration
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail;
+      export ORACLE_HOME={{ oracle_home }} ORACLE_SID={{ oracle_sid }} PATH={{ oracle_home }}/bin:$PATH;
+      rman target / cmdfile={{ rman_script_dir }}/configure.rman | tee {{ rman_log_dir }}/configure.log
+  become: true
+  become_user: "{{ oracle_user }}"
+  register: backup_rman_configure
+  when: backup_rman_missing | length > 0
+  changed_when: true
+  failed_when: "'RMAN-' in backup_rman_configure.stdout or 'ORA-' in backup_rman_configure.stdout"
+
+- name: Install the templated backup service
+  ansible.builtin.template:
+    src: oracle-rman-backup@.service.j2
+    dest: /etc/systemd/system/oracle-rman-backup@.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload systemd
+
+- name: Install one timer per backup level
+  ansible.builtin.template:
+    src: oracle-rman-backup@.timer.j2
+    dest: "/etc/systemd/system/oracle-rman-backup@{{ item.level }}.timer"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - { level: level0, oncalendar: "{{ rman_level0_oncalendar }}", jitter: "15m" }
+    - { level: level1, oncalendar: "{{ rman_level1_oncalendar }}", jitter: "15m" }
+    - { level: archivelog, oncalendar: "{{ rman_archivelog_oncalendar }}", jitter: "2m" }
+  loop_control:
+    label: "{{ item.level }}"
+  notify: Reload systemd
+
+- name: Flush handlers before enabling timers
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable and start the backup timers
+  ansible.builtin.systemd_service:
+    name: "oracle-rman-backup@{{ item }}.timer"
+    enabled: true
+    state: started
+  loop: [level0, level1, archivelog]

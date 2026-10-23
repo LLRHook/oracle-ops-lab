@@ -1,0 +1,31 @@
+---
+- name: Scrape node_exporter
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ node_exporter_port }}/metrics"
+    return_content: true
+  register: monitoring_node_metrics
+  retries: 5
+  delay: 3
+  until: monitoring_node_metrics.status == 200
+
+- name: Scrape the Oracle exporter (first scrape warms the connection pool)
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ oracledb_exporter_port }}/metrics"
+    return_content: true
+  register: monitoring_db_metrics
+  retries: 10
+  delay: 6
+  until: monitoring_db_metrics.status == 200 and monitoring_db_metrics.content is search(monitoring_up_regex, multiline=True)
+  vars:
+    monitoring_up_regex: '^oracledb_up(\{[^}]*\})? 1$'
+
+- name: Assert the key series are present
+  ansible.builtin.assert:
+    that:
+      - "'node_memory_HugePages_Total' in monitoring_node_metrics.content"
+      # the exporter labels every series with database="<config key>", so match by regex
+      - monitoring_db_metrics.content is search('^oracledb_up(\\{[^}]*\\})? 1$', multiline=True)
+      - "'oracledb_ops_fra_used_percent_net' in monitoring_db_metrics.content"
+      - "'oracledb_ops_tablespace_used_percent' in monitoring_db_metrics.content"
+      - monitoring_db_metrics.content is search('^oracledb_ops_sga_large_pages_only(\\{[^}]*\\})? 1$', multiline=True)
+    quiet: true

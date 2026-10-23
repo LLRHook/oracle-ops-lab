@@ -1,0 +1,23 @@
+# {{ ansible_managed }}
+[Unit]
+Description=Prometheus node_exporter {{ node_exporter_version }}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=node_exporter
+Group=node_exporter
+ExecStart=/usr/local/bin/node_exporter \
+  --web.listen-address=:{{ node_exporter_port }} \
+  --collector.textfile.directory={{ node_exporter_textfile_dir }} \
+  --collector.systemd \
+  --collector.systemd.unit-include=(oracle-.*|node_exporter|oracledb_exporter|chronyd|firewalld)[.](service|timer)
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

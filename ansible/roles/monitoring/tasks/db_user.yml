@@ -1,0 +1,24 @@
+---
+- name: Check whether the monitoring account exists
+  ansible.builtin.command:
+    argv: [/usr/local/bin/oraops-sql, "select count(*) from dba_users where username = '{{ oracledb_exporter_user }}'"]
+  become: true
+  become_user: "{{ oracle_user }}"
+  register: monitoring_db_user
+  changed_when: false
+
+- name: Create a common (CDB-wide) read-only monitoring account
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/oraops-sql
+      - |
+        create user {{ oracledb_exporter_user }} identified by "{{ oracle_exporter_password }}" container=all;
+        grant create session to {{ oracledb_exporter_user }} container=all;
+        grant select_catalog_role to {{ oracledb_exporter_user }} container=all;
+        grant select any dictionary to {{ oracledb_exporter_user }} container=all;
+        alter user {{ oracledb_exporter_user }} set container_data=all container=current;
+  become: true
+  become_user: "{{ oracle_user }}"
+  when: monitoring_db_user.stdout | trim == '0'
+  changed_when: true
+  no_log: true

@@ -1,0 +1,56 @@
+---
+- name: Create the node_exporter system user
+  ansible.builtin.user:
+    name: node_exporter
+    system: true
+    shell: /sbin/nologin
+    create_home: false
+
+- name: Download node_exporter (checksum from the upstream sha256sums.txt)
+  ansible.builtin.get_url:
+    url: "{{ node_exporter_url }}"
+    dest: "/var/tmp/node_exporter-{{ node_exporter_version }}.linux-arm64.tar.gz"
+    checksum: "sha256:{{ node_exporter_sha256 }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Unpack node_exporter under /opt
+  ansible.builtin.unarchive:
+    src: "/var/tmp/node_exporter-{{ node_exporter_version }}.linux-arm64.tar.gz"
+    dest: /opt
+    remote_src: true
+    owner: root
+    group: root
+    creates: "/opt/node_exporter-{{ node_exporter_version }}.linux-arm64/node_exporter"
+
+- name: Link the versioned binary into PATH
+  ansible.builtin.file:
+    src: "/opt/node_exporter-{{ node_exporter_version }}.linux-arm64/node_exporter"
+    dest: /usr/local/bin/node_exporter
+    state: link
+  notify: Restart node_exporter
+
+- name: Ensure the textfile collector directory exists
+  ansible.builtin.file:
+    path: "{{ node_exporter_textfile_dir }}"
+    state: directory
+    owner: root
+    group: "{{ oracle_group }}"
+    mode: "0775"
+
+- name: Install the node_exporter unit
+  ansible.builtin.template:
+    src: node_exporter.service.j2
+    dest: /etc/systemd/system/node_exporter.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart node_exporter
+
+- name: Enable and start node_exporter
+  ansible.builtin.systemd_service:
+    name: node_exporter
+    enabled: true
+    state: started
+    daemon_reload: true

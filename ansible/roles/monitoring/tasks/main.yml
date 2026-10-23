@@ -1,0 +1,12 @@
+---
+- name: Install node_exporter
+  ansible.builtin.import_tasks: node_exporter.yml
+
+- name: Create the exporter database account
+  ansible.builtin.import_tasks: db_user.yml
+
+- name: Install the Oracle metrics exporter
+  ansible.builtin.import_tasks: oracledb_exporter.yml
+
+- name: Check both exporters answer
+  ansible.builtin.import_tasks: verify.yml

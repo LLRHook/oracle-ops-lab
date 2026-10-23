@@ -1,0 +1,25 @@
+# {{ ansible_managed }}
+[Unit]
+Description=Oracle Database metrics exporter {{ oracledb_exporter_version }}
+After={{ oracle_service }}.service network-online.target
+Wants=network-online.target
+
+[Service]
+# Runs as the oracle OS user so it can load the client libraries from ORACLE_HOME
+# (the godror driver needs libclntsh); no separate Instant Client install is required
+# on the database host itself.
+User={{ oracle_user }}
+Group={{ oracle_group }}
+Environment=ORACLE_HOME={{ oracle_home }}
+Environment=LD_LIBRARY_PATH={{ oracle_home }}/lib
+Environment=TNS_ADMIN={{ oracle_home }}/network/admin
+EnvironmentFile={{ oracledb_exporter_dir }}/env
+WorkingDirectory={{ oracledb_exporter_dir }}
+ExecStart=/usr/local/bin/oracledb_exporter --config.file={{ oracledb_exporter_dir }}/config.yaml
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
