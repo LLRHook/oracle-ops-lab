@@ -1,0 +1,36 @@
+# {{ ansible_managed }}
+#
+# Device-mapper multipath for Oracle data disks on a SAN.
+#
+# Each LUN is reachable over several physical paths (two HBAs x two fabric switches
+# x two array controllers is typical). Without multipath the OS sees one /dev/sdX per
+# path; multipathd folds them into one /dev/mapper/<alias> device that keeps working
+# when a path fails and spreads I/O across the paths that are up.
+#
+# The aliases below give stable, meaningful names so LVM and fstab never depend on
+# /dev/sdX ordering, which changes between boots and after hardware changes.
+
+defaults {
+    user_friendly_names   no      # use WWID-based names unless an alias matches
+    find_multipaths       yes     # only claim devices that actually have >1 path
+    path_selector         "service-time 0"
+    path_grouping_policy  group_by_prio
+    failback              immediate
+    no_path_retry         fail    # do not queue forever: Oracle must see an I/O error
+    rr_min_io_rq          1
+}
+
+blacklist {
+    # Never multipath the local/virtual boot disks.
+    devnode "^(ram|raw|loop|fd|md|dm-|sr|scd|st|vd)[0-9]*"
+    devnode "^nvme[0-9]"
+}
+
+multipaths {
+{% for m in multipath_aliases %}
+    multipath {
+        wwid   "{{ m.wwid }}"
+        alias  "{{ m.alias }}"
+    }
+{% endfor %}
+}

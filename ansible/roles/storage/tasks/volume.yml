@@ -1,0 +1,86 @@
+---
+# One disk -> one PV -> one VG -> one LV -> XFS -> mount. Guard rails first: the device
+# must exist, be at least the expected size and carry either no signature at all or
+# the LVM signature of the VG we own. Anything else aborts rather than overwriting it.
+- name: Read device size, type and signature of {{ vol.device }}
+  ansible.builtin.command:
+    argv: [lsblk, -ndo, "SIZE,TYPE,FSTYPE", -b, "{{ vol.device }}"]
+  register: storage_dev_info
+  changed_when: false
+
+- name: Parse device facts for {{ vol.device }}
+  ansible.builtin.set_fact:
+    storage_dev_size_gib: "{{ (storage_dev_info.stdout.split()[0] | int) / 1073741824 }}"
+    storage_dev_type: "{{ storage_dev_info.stdout.split()[1] }}"
+    storage_dev_fstype: "{{ storage_dev_info.stdout.split()[2] | default('') }}"
+
+- name: Guard against the wrong disk on {{ vol.device }}
+  ansible.builtin.assert:
+    that:
+      - storage_dev_type == 'disk'
+      - storage_dev_size_gib | float >= vol.min_size_gib | float
+      - storage_dev_fstype in ['', 'LVM2_member']
+    fail_msg: >-
+      Refusing to touch {{ vol.device }}: type={{ storage_dev_type }} size={{ storage_dev_size_gib }}GiB
+      fstype='{{ storage_dev_fstype }}' (expected a blank disk >= {{ vol.min_size_gib }} GiB or our own PV).
+    quiet: true
+
+- name: Check that an existing PV belongs to our VG on {{ vol.device }}
+  when: storage_dev_fstype == 'LVM2_member'
+  block:
+    - name: Read owning VG of {{ vol.device }}
+      ansible.builtin.command:
+        argv: [pvs, --noheadings, -o, vg_name, "{{ vol.device }}"]
+      register: storage_pv_vg
+      changed_when: false
+    - name: Assert VG ownership of {{ vol.device }}
+      ansible.builtin.assert:
+        that: storage_pv_vg.stdout | trim == vol.vg
+        fail_msg: "{{ vol.device }} is a PV of '{{ storage_pv_vg.stdout | trim }}', not {{ vol.vg }}."
+        quiet: true
+
+- name: Create volume group {{ vol.vg }}
+  community.general.lvg:
+    vg: "{{ vol.vg }}"
+    pvs: "{{ vol.device }}"
+    state: present
+
+- name: Create logical volume using the whole VG {{ vol.lv }}
+  community.general.lvol:
+    vg: "{{ vol.vg }}"
+    lv: "{{ vol.lv }}"
+    size: 100%VG
+    state: present
+    shrink: false
+
+- name: Create XFS filesystem on {{ vol.lv }}
+  community.general.filesystem:
+    fstype: "{{ storage_fstype }}"
+    dev: "/dev/{{ vol.vg }}/{{ vol.lv }}"
+    state: present
+
+# Same owner/mode as the post-mount task: once mounted this path is the filesystem
+# root, and two tasks disagreeing on its mode would flip it on every run.
+- name: Create mount point {{ vol.mount }}
+  ansible.builtin.file:
+    path: "{{ vol.mount }}"
+    state: directory
+    owner: "{{ oracle_user }}"
+    group: "{{ oracle_group }}"
+    mode: "0750"
+
+- name: Mount and persist in fstab {{ vol.mount }}
+  ansible.posix.mount:
+    path: "{{ vol.mount }}"
+    src: "/dev/{{ vol.vg }}/{{ vol.lv }}"
+    fstype: "{{ storage_fstype }}"
+    opts: "{{ storage_mount_opts }}"
+    state: mounted
+
+- name: Hand ownership to the oracle user for {{ vol.mount }}
+  ansible.builtin.file:
+    path: "{{ vol.mount }}"
+    state: directory
+    owner: "{{ oracle_user }}"
+    group: "{{ oracle_group }}"
+    mode: "0750"

@@ -1,0 +1,27 @@
+---
+# End-to-end converge of an Oracle Linux VM into a tuned, backed-up, monitored
+# Oracle Database Free host. Roles run in dependency order:
+#   baseline    -> packages, time sync, firewall, SELinux, journald
+#   os_prereqs  -> Oracle preinstall RPM, kernel/limits assertions, hugepages, THP off
+#   storage     -> LVM + XFS on the data/redo/FRA disks (needs the oracle user from os_prereqs)
+#   oracle_db   -> Oracle Database Free install + instance configuration
+#   backup      -> RMAN scripts, systemd timers, backup-freshness metric
+#   monitoring  -> node_exporter + Oracle metrics exporter
+- name: Converge Oracle database host
+  hosts: oracle_db
+  become: true
+  vars_files:
+    - secrets/secrets.yml
+  roles:
+    - role: baseline
+      tags: [baseline]
+    - role: os_prereqs
+      tags: [os_prereqs]
+    - role: storage
+      tags: [storage]
+    - role: oracle_db
+      tags: [oracle_db]
+    - role: backup
+      tags: [backup]
+    - role: monitoring
+      tags: [monitoring]

@@ -1,0 +1,31 @@
+---
+# In the lab there is no SAN and no second path to any disk, so multipath stays off.
+# The template is rendered only when multipath_enabled is true, which a production
+# inventory would set alongside real WWIDs.
+- name: Install device-mapper-multipath
+  ansible.builtin.dnf:
+    name: device-mapper-multipath
+    state: present
+  when: multipath_enabled
+
+- name: Render /etc/multipath.conf
+  ansible.builtin.template:
+    src: multipath.conf.j2
+    dest: /etc/multipath.conf
+    owner: root
+    group: root
+    mode: "0644"
+  when: multipath_enabled
+  notify: Reload multipathd
+
+- name: Enable multipathd
+  ansible.builtin.systemd_service:
+    name: multipathd
+    enabled: true
+    state: started
+  when: multipath_enabled
+
+- name: Report that multipath is disabled in this inventory
+  ansible.builtin.debug:
+    msg: "multipath_enabled=false: no SAN paths in the lab; see roles/storage/templates/multipath.conf.j2."
+  when: not multipath_enabled

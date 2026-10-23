@@ -1,0 +1,137 @@
+---
+# ---------------------------------------------------------------------------
+# Versions and artifacts. Every external artifact is pinned and checksum-verified.
+# Checksums were taken from the vendor's published value where one exists
+# (Oracle download page, node_exporter sha256sums.txt); where the vendor publishes
+# none (oracledb_exporter) the value was computed from the release asset on
+# 2026-10-23 and pinned here (trust-on-first-use, recorded in docs/EVIDENCE.md).
+# ---------------------------------------------------------------------------
+oracle_release: "26ai"
+oracle_free_rpm_file: "oracle-ai-database-free-26ai-23.26.3-1.el9.aarch64.rpm"
+oracle_free_rpm_url: "https://download.oracle.com/otn-pub/otn_software/db-free/{{ oracle_free_rpm_file }}"
+oracle_free_rpm_sha256: "b2a087b8e6d67d99f0cd9b950429b4afd58b71991fd05b5d6254ac84cade94e1"
+oracle_free_rpm_package: "oracle-ai-database-free-26ai"
+oracle_preinstall_package: "oracle-ai-database-preinstall-26ai"
+
+node_exporter_version: "1.12.1"
+node_exporter_url: >-
+  https://github.com/prometheus/node_exporter/releases/download/v{{ node_exporter_version
+  }}/node_exporter-{{ node_exporter_version }}.linux-arm64.tar.gz
+node_exporter_sha256: "ad35b605f9954b9f1ffddf5ba054bdc5a98d790b9eae5291e1eeb83f1ecbd0e7"
+
+# glibc-2.28 build: the default linux-arm64 asset is linked against glibc 2.39; OL9 ships 2.34.
+oracledb_exporter_version: "2.5.1"
+oracledb_exporter_release_url: "https://github.com/oracle/oracle-db-appdev-monitoring/releases/download/v{{ oracledb_exporter_version }}"
+oracledb_exporter_url: "{{ oracledb_exporter_release_url }}/oracledb_exporter-{{ oracledb_exporter_version }}.linux-arm64-glibc-2.28.tar.gz"
+oracledb_exporter_sha256: "7f352bf4ae2b71617a174ed589e6d9f9b625cfabb5cd3094ba5d3d26183c1c89"
+oracledb_exporter_default_metrics_url: "{{ oracledb_exporter_release_url }}/default-metrics.toml"
+oracledb_exporter_default_metrics_sha256: "c65d69effd2d44bfeb2d50806c5e9ac264917cef05be297f653f038d4ce1c907"
+
+# ---------------------------------------------------------------------------
+# Oracle identity and layout
+# ---------------------------------------------------------------------------
+oracle_user: oracle
+oracle_group: oinstall
+oracle_dba_group: dba
+oracle_base: /opt/oracle
+oracle_home: /opt/oracle/product/26ai/dbhomeFree
+oracle_sid: FREE
+oracle_pdb: FREEPDB1
+oracle_service: oracle-free-26ai
+oracle_sysconfig: /etc/sysconfig/oracle-free-26ai.conf
+oracle_listener_port: 1521
+oracle_charset: AL32UTF8
+
+# Separate volumes, mirroring one VMDK per role in production.
+oracle_data_dir: /u02/oradata
+oracle_redo_dir: /u03/redo
+oracle_fra_dir: /u04/fra
+
+# ---------------------------------------------------------------------------
+# Memory. Oracle Database Free caps SGA+PGA at 2 GiB; keep headroom under it.
+# nr_hugepages is derived at run time from oracle_sga_mb and the kernel's
+# Hugepagesize (read from /proc/meminfo, never assumed).
+# ---------------------------------------------------------------------------
+oracle_sga_mb: 1536
+oracle_pga_mb: 384
+# Extra huge pages beyond ceil(SGA / Hugepagesize): Oracle needs a few pages per shared
+# memory segment for headers. 16 x 2 MiB = 32 MiB of slack.
+hugepages_headroom_pages: 16
+thp_mode: never
+
+# Redo: three groups, one member each, on the redo volume.
+oracle_redo_groups: 3
+oracle_redo_size_mb: 200
+
+# Fast Recovery Area quota (must fit the FRA volume with slack for the filesystem).
+oracle_fra_size_mb: 15360
+
+# ---------------------------------------------------------------------------
+# Storage: LVM on the extra virtual disks. Lima attaches additionalDisks in the
+# order listed in lima/oracle-ops-lab.yaml, after the root disk, so they appear as
+# /dev/vdb, /dev/vdc, /dev/vdd. Lima/VZ exposes no serial or WWN, so the role guards
+# each device by expected size and by the absence of any foreign signature before
+# touching it. In production you address disks by /dev/disk/by-id (WWN) or by a
+# multipath alias (see roles/storage/templates/multipath.conf.j2).
+# ---------------------------------------------------------------------------
+storage_volumes:
+  - device: /dev/vdb
+    min_size_gib: 19
+    vg: vg_oradata
+    lv: lv_oradata
+    mount: "{{ oracle_data_dir }}"
+  - device: /dev/vdc
+    min_size_gib: 3
+    vg: vg_redo
+    lv: lv_redo
+    mount: "{{ oracle_redo_dir }}"
+  - device: /dev/vdd
+    min_size_gib: 19
+    vg: vg_fra
+    lv: lv_fra
+    mount: "{{ oracle_fra_dir }}"
+storage_fstype: xfs
+storage_mount_opts: "noatime,nodiratime"
+
+# No SAN paths in the lab; the template is shipped for review only.
+multipath_enabled: false
+multipath_aliases:
+  - { wwid: "36000d31000a1b2000000000000000001", alias: oradata }
+  - { wwid: "36000d31000a1b2000000000000000002", alias: redo }
+  - { wwid: "36000d31000a1b2000000000000000003", alias: fra }
+
+# ---------------------------------------------------------------------------
+# Backup (RMAN)
+# ---------------------------------------------------------------------------
+rman_recovery_window_days: 7
+rman_script_dir: "{{ oracle_base }}/admin/{{ oracle_sid }}/rman"
+rman_log_dir: /var/log/oracle-rman
+rman_level0_oncalendar: "Sun *-*-* 01:00:00"
+rman_level1_oncalendar: "Mon..Sat *-*-* 01:00:00"
+rman_archivelog_oncalendar: "*-*-* *:15:00"
+
+# ---------------------------------------------------------------------------
+# Monitoring
+# ---------------------------------------------------------------------------
+node_exporter_port: 9100
+node_exporter_textfile_dir: /var/lib/node_exporter/textfile_collector
+oracledb_exporter_port: 9161
+oracledb_exporter_user: "C##OPSMON"
+oracledb_exporter_dir: /etc/oracledb_exporter
+
+# Firewall: listener plus the two exporters.
+firewall_tcp_ports:
+  - "{{ oracle_listener_port }}"
+  - "{{ node_exporter_port }}"
+  - "{{ oracledb_exporter_port }}"
+
+baseline_packages:
+  - chrony
+  - firewalld
+  - lvm2
+  - xfsprogs
+  - dnf-utils
+  - policycoreutils-python-utils
+  - tar
+  - unzip
+  - bc

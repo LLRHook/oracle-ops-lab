@@ -1,0 +1,15 @@
+---
+- name: Ensure LVM and XFS tooling is present
+  ansible.builtin.dnf:
+    name: [lvm2, xfsprogs]
+    state: present
+
+- name: Build each volume (guarded, idempotent)
+  ansible.builtin.include_tasks: volume.yml
+  loop: "{{ storage_volumes }}"
+  loop_control:
+    loop_var: vol
+    label: "{{ vol.device }} -> {{ vol.mount }}"
+
+- name: Configure multipath
+  ansible.builtin.include_tasks: multipath.yml

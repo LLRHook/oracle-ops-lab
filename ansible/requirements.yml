@@ -1,0 +1,9 @@
+---
+# Collections are pinned and installed into ansible/collections (gitignored) by `make bootstrap`.
+# community.general : community.general.lvg / lvol / filesystem (LVM + XFS in the storage role)
+# ansible.posix     : ansible.posix.mount / sysctl / firewalld / selinux
+collections:
+  - name: community.general
+    version: 13.5.0
+  - name: ansible.posix
+    version: 2.2.2

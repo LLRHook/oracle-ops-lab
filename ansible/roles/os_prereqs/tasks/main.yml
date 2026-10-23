@@ -1,0 +1,223 @@
+---
+# The Oracle preinstall RPM creates the oracle user and groups, writes the recommended
+# kernel parameters to /etc/sysctl.d/99-<pkg>-sysctl.conf, writes per-user limits to
+# /etc/security/limits.d/<pkg>.conf and enables a "firstboot" service that would, on the
+# next boot, add numa=off and transparent_hugepage=madvise to the kernel command line.
+# We take over the kernel-argument part ourselves (we want THP *never*, and we want it
+# applied explicitly and visibly), so the firstboot hook is switched off through its
+# own documented switch (RUN_<PKG>=NO in its .conf file).
+- name: Install the Oracle preinstall RPM
+  ansible.builtin.dnf:
+    name: "{{ oracle_preinstall_package }}"
+    state: present
+  register: os_prereqs_preinstall_install
+
+- name: Disable the preinstall firstboot hook (we manage kernel arguments explicitly)
+  ansible.builtin.copy:
+    dest: "/etc/sysconfig/{{ oracle_preinstall_package }}/{{ oracle_preinstall_package }}.conf"
+    owner: root
+    group: root
+    mode: "0600"
+    content: |
+      # Managed by Ansible (oracle-ops-lab): the firstboot hook would set
+      # transparent_hugepage=madvise and numa=off; the os_prereqs role owns these.
+      RUN_{{ oracle_preinstall_package | upper | replace('-', '_') }}=NO
+
+- name: Make sure the firstboot service is disabled
+  ansible.builtin.systemd_service:
+    name: "{{ oracle_preinstall_package }}-firstboot.service"
+    enabled: false
+
+- name: Assert the oracle user exists with the expected primary group
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ oracle_user }}"
+
+# --------------------------------------------------------------------------
+# Kernel parameters: the RPM set them; we assert they hold. An assertion, not a
+# second copy of the values, so that the RPM stays the single source of truth and
+# a regression (someone editing sysctl.conf) is caught on the next run.
+# --------------------------------------------------------------------------
+- name: Read the kernel parameters the preinstall RPM is responsible for
+  ansible.builtin.command:
+    argv:
+      - sysctl
+      - -n
+      - kernel.shmmax
+      - kernel.shmall
+      - kernel.shmmni
+      - kernel.sem
+      - fs.file-max
+      - fs.aio-max-nr
+      - net.ipv4.ip_local_port_range
+      - net.core.rmem_default
+      - net.core.rmem_max
+      - net.core.wmem_default
+      - net.core.wmem_max
+      - kernel.panic_on_oops
+      - vm.hugetlb_shm_group
+  register: os_prereqs_sysctl_values
+  changed_when: false
+
+- name: Assert the kernel parameters meet Oracle's minimums
+  ansible.builtin.assert:
+    that:
+      - os_prereqs_sysctl_values.stdout_lines[0] | int >= 4398046511104
+      - os_prereqs_sysctl_values.stdout_lines[1] | int >= 1073741824
+      - os_prereqs_sysctl_values.stdout_lines[2] | int >= 4096
+      - os_prereqs_sysctl_values.stdout_lines[3] | regex_replace('\\s+', ' ') == '250 32000 100 128'
+      - os_prereqs_sysctl_values.stdout_lines[4] | int >= 6815744
+      - os_prereqs_sysctl_values.stdout_lines[5] | int >= 1048576
+      - os_prereqs_sysctl_values.stdout_lines[6] | regex_replace('\\s+', ' ') == '9000 65535'
+      - os_prereqs_sysctl_values.stdout_lines[7] | int >= 262144
+      - os_prereqs_sysctl_values.stdout_lines[8] | int >= 4194304
+      - os_prereqs_sysctl_values.stdout_lines[9] | int >= 262144
+      - os_prereqs_sysctl_values.stdout_lines[10] | int >= 1048576
+      - os_prereqs_sysctl_values.stdout_lines[11] | int == 1
+      - os_prereqs_sysctl_values.stdout_lines[12] | int == (getent_passwd[oracle_user][2] | int)
+    fail_msg: "Kernel parameters drifted from the preinstall RPM values: {{ os_prereqs_sysctl_values.stdout_lines }}"
+    quiet: true
+
+# --------------------------------------------------------------------------
+# Huge pages. Size from the configured SGA and the *actual* Hugepagesize.
+# --------------------------------------------------------------------------
+- name: Read Hugepagesize from /proc/meminfo
+  ansible.builtin.command:
+    argv: [awk, '/^Hugepagesize:/ {print $2}', /proc/meminfo]
+  register: os_prereqs_hugepagesize_kb_cmd
+  changed_when: false
+
+- name: Compute the number of huge pages required for the SGA
+  ansible.builtin.set_fact:
+    os_prereqs_hugepagesize_kb: "{{ os_prereqs_hugepagesize_kb_cmd.stdout | int }}"
+    # ceil(SGA_kB / Hugepagesize_kB) + headroom
+    os_prereqs_nr_hugepages: >-
+      {{ (((oracle_sga_mb | int) * 1024 + (os_prereqs_hugepagesize_kb_cmd.stdout | int) - 1)
+          // (os_prereqs_hugepagesize_kb_cmd.stdout | int)) + (hugepages_headroom_pages | int) }}
+
+- name: Show the hugepage sizing decision
+  ansible.builtin.debug:
+    msg: >-
+      SGA {{ oracle_sga_mb }} MiB / Hugepagesize {{ os_prereqs_hugepagesize_kb }} kB
+      -> vm.nr_hugepages={{ os_prereqs_nr_hugepages }}
+      ({{ (os_prereqs_nr_hugepages | int) * (os_prereqs_hugepagesize_kb | int) // 1024 }} MiB reserved)
+
+- name: Assert the huge page reservation leaves room for the OS and PGA
+  ansible.builtin.assert:
+    that:
+      - (os_prereqs_nr_hugepages | int) * (os_prereqs_hugepagesize_kb | int) // 1024 < (ansible_facts['memtotal_mb'] | int) * 70 // 100
+    fail_msg: "Huge page reservation would exceed 70% of RAM ({{ ansible_facts['memtotal_mb'] }} MiB)."
+    quiet: true
+
+- name: Reserve huge pages persistently (sysctl.d) and immediately
+  ansible.posix.sysctl:
+    name: vm.nr_hugepages
+    value: "{{ os_prereqs_nr_hugepages }}"
+    sysctl_file: /etc/sysctl.d/98-oracle-ops-lab-hugepages.conf
+    sysctl_set: true
+    reload: true
+    state: present
+
+- name: Read the resulting huge page pool
+  ansible.builtin.command:
+    argv: [awk, '/^HugePages_Total:/ {print $2}', /proc/meminfo]
+  register: os_prereqs_hugepages_total
+  changed_when: false
+
+- name: Assert the kernel could actually allocate the pool (fails on fragmented memory)
+  ansible.builtin.assert:
+    that: os_prereqs_hugepages_total.stdout | int == os_prereqs_nr_hugepages | int
+    fail_msg: >-
+      Requested {{ os_prereqs_nr_hugepages }} huge pages but the kernel provides {{ os_prereqs_hugepages_total.stdout }}.
+      Memory is fragmented; reboot so the pool is carved out at boot.
+    quiet: true
+
+# --------------------------------------------------------------------------
+# Limits. The RPM writes memlock = 90% of RAM; assert it covers the huge page pool
+# (Oracle locks the SGA in memory, so memlock must be >= SGA in kB).
+# --------------------------------------------------------------------------
+- name: Read the oracle user's effective limits
+  ansible.builtin.command:
+    argv: [runuser, -u, "{{ oracle_user }}", --, bash, -c, "ulimit -l; ulimit -Hl; ulimit -n; ulimit -Hn; ulimit -u; ulimit -Hu"]
+  register: os_prereqs_ulimits
+  changed_when: false
+
+- name: Assert memlock, nofile and nproc limits for the oracle user
+  ansible.builtin.assert:
+    that:
+      - os_prereqs_ulimits.stdout_lines[0] | int >= (os_prereqs_nr_hugepages | int) * (os_prereqs_hugepagesize_kb | int)
+      - os_prereqs_ulimits.stdout_lines[1] | int >= (os_prereqs_nr_hugepages | int) * (os_prereqs_hugepagesize_kb | int)
+      - os_prereqs_ulimits.stdout_lines[2] | int >= 1024
+      - os_prereqs_ulimits.stdout_lines[3] | int >= 65536
+      - os_prereqs_ulimits.stdout_lines[4] | int >= 16384
+      - os_prereqs_ulimits.stdout_lines[5] | int >= 16384
+    fail_msg: "oracle limits (memlock soft/hard, nofile soft/hard, nproc soft/hard) = {{ os_prereqs_ulimits.stdout_lines }}"
+    quiet: true
+
+# --------------------------------------------------------------------------
+# Transparent Huge Pages: off, persistently, via the kernel command line.
+# grubby edits every BLS entry; a reboot is needed before /proc/cmdline shows it.
+# The runtime sysfs write makes the current boot match without waiting.
+# --------------------------------------------------------------------------
+- name: Read the default kernel's boot arguments
+  ansible.builtin.command:
+    argv: [grubby, --info=DEFAULT]
+  register: os_prereqs_grubby_info
+  changed_when: false
+
+- name: Add the THP mode to all kernel entries as transparent_hugepage={{ thp_mode }}
+  ansible.builtin.command:
+    argv: [grubby, --update-kernel=ALL, "--args=transparent_hugepage={{ thp_mode }}"]
+  when: "('transparent_hugepage=' ~ thp_mode) not in os_prereqs_grubby_info.stdout"
+  changed_when: true
+
+# The kernel argument only governs .../enabled; .../defrag keeps its default (madvise)
+# after every boot. With enabled=never that is inert, but we persist defrag too via
+# tmpfiles.d so the host state is unambiguous and a second run after a reboot changes nothing.
+- name: Persist the THP defrag mode across reboots via tmpfiles.d
+  ansible.builtin.copy:
+    dest: /etc/tmpfiles.d/oracle-ops-lab-thp.conf
+    content: |
+      # Managed by Ansible (oracle-ops-lab). transparent_hugepage={{ thp_mode }} on the
+      # kernel command line sets 'enabled'; this sets 'defrag' at boot to match.
+      w /sys/kernel/mm/transparent_hugepage/defrag - - - - {{ thp_mode }}
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Read current THP state
+  ansible.builtin.command:
+    argv: [cat, /sys/kernel/mm/transparent_hugepage/enabled, /sys/kernel/mm/transparent_hugepage/defrag]
+  register: os_prereqs_thp_state
+  changed_when: false
+
+- name: Apply THP mode to the running kernel
+  ansible.builtin.shell: |
+    echo {{ thp_mode }} > /sys/kernel/mm/transparent_hugepage/enabled
+    echo {{ thp_mode }} > /sys/kernel/mm/transparent_hugepage/defrag
+  when: "('[' ~ thp_mode ~ ']') not in os_prereqs_thp_state.stdout_lines[0] or ('[' ~ thp_mode ~ ']') not in os_prereqs_thp_state.stdout_lines[1]"
+  changed_when: true
+
+- name: Read the live kernel command line
+  ansible.builtin.slurp:
+    src: /proc/cmdline
+  register: os_prereqs_proc_cmdline
+
+- name: Reboot once so the kernel command line carries the THP setting
+  ansible.builtin.reboot:
+    msg: "oracle-ops-lab: reboot to apply transparent_hugepage={{ thp_mode }}"
+    reboot_timeout: 600
+  when: "('transparent_hugepage=' ~ thp_mode) not in (os_prereqs_proc_cmdline.content | b64decode)"
+
+- name: Re-read THP state after any reboot
+  ansible.builtin.command:
+    argv: [cat, /sys/kernel/mm/transparent_hugepage/enabled, /sys/kernel/mm/transparent_hugepage/defrag]
+  register: os_prereqs_thp_final
+  changed_when: false
+
+- name: Assert THP enabled and defrag are {{ thp_mode }}
+  ansible.builtin.assert:
+    that:
+      - "('[' ~ thp_mode ~ ']') in os_prereqs_thp_final.stdout_lines[0]"
+      - "('[' ~ thp_mode ~ ']') in os_prereqs_thp_final.stdout_lines[1]"
+    quiet: true

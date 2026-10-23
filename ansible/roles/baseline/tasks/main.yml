@@ -1,0 +1,71 @@
+---
+- name: Install baseline packages
+  ansible.builtin.dnf:
+    name: "{{ baseline_packages }}"
+    state: present
+
+- name: Enable and start chronyd (time sync matters for redo timestamps, RMAN and alert math)
+  ansible.builtin.systemd_service:
+    name: chronyd
+    enabled: true
+    state: started
+
+- name: Enable and start firewalld
+  ansible.builtin.systemd_service:
+    name: firewalld
+    enabled: true
+    state: started
+
+- name: Open listener and exporter ports in the public zone
+  ansible.posix.firewalld:
+    port: "{{ item }}/tcp"
+    zone: public
+    permanent: true
+    immediate: true
+    state: enabled
+  loop: "{{ firewall_tcp_ports }}"
+
+- name: Keep SELinux enforcing with the targeted policy
+  ansible.posix.selinux:
+    policy: targeted
+    state: enforcing
+
+- name: Create the journald drop-in directory
+  ansible.builtin.file:
+    path: /etc/systemd/journald.conf.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Persist the systemd journal across reboots
+  ansible.builtin.copy:
+    dest: /etc/systemd/journald.conf.d/10-persistent.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by Ansible (oracle-ops-lab). Keep logs across reboots so that a
+      # post-incident review can see what happened before the last restart.
+      [Journal]
+      Storage=persistent
+      SystemMaxUse=512M
+      Compress=yes
+  notify: Restart journald
+
+- name: Ensure the persistent journal directory exists
+  ansible.builtin.file:
+    path: /var/log/journal
+    state: directory
+    owner: root
+    group: systemd-journal
+    mode: "2755"
+  notify: Restart journald
+
+- name: Create the lab log directory
+  ansible.builtin.file:
+    path: /var/log/oracle-ops-lab
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
