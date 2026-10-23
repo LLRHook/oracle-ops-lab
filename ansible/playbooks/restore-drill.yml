@@ -21,7 +21,6 @@
     drill_rows_after: 500
     drill_datafile: "{{ oracle_data_dir }}/{{ oracle_sid }}/{{ oracle_pdb }}/drill01.dbf"
     drill_report_dir: "{{ playbook_dir }}/../../docs/drills"
-    drill_stamp: "{{ lookup('pipe', 'date -u +%Y%m%dT%H%M%SZ') }}"
     drill_restore_filter: "Starting|Finished|restoring|piece handle|media recovery|archived log for thread|Statement processed|channel ORA_DISK_1: "
     drill_nl: "\n"  # a real newline for join(); a Jinja '\n' literal would be written verbatim
     rman_env:
@@ -31,6 +30,13 @@
       PATH: "{{ oracle_home }}/bin:/usr/local/bin:/usr/bin:/bin"
       NLS_DATE_FORMAT: "YYYY-MM-DD HH24:MI:SS"
   tasks:
+    # Fix the timestamp once. A `vars:` entry holding a pipe lookup is re-evaluated at
+    # every reference, so the log names, the DRILL password and the report name could
+    # each get a different stamp.
+    - name: Stamp this drill run
+      ansible.builtin.set_fact:
+        drill_stamp: "{{ lookup('pipe', 'date -u +%Y%m%dT%H%M%SZ') }}"
+
     # ------------------------------------------------------------------ (a)
     - name: (a) RESTORE DATABASE VALIDATE against the current backups
       ansible.builtin.shell:
