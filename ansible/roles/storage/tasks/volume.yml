@@ -1,28 +1,42 @@
 ---
 # One disk -> one PV -> one VG -> one LV -> XFS -> mount. Guard rails first: the device
-# must exist, be at least the expected size and carry either no signature at all or
-# the LVM signature of the VG we own. Anything else aborts rather than overwriting it.
-- name: Read device size, type and signature of {{ vol.device }}
+# must exist, be a whole disk, be at least the expected size, carry no partition table
+# and carry either no filesystem signature at all or the LVM signature of the VG we own.
+# Anything else aborts rather than overwriting it. Size and type come from lsblk; the
+# signatures come from `blkid -p`, which probes the device directly instead of reading
+# the udev database (lsblk's FSTYPE/PTTYPE are udev-backed and can be empty or stale,
+# e.g. for a device udev never probed). blkid -p exits 2 when it finds no signature.
+- name: Read device size and type of {{ vol.device }}
   ansible.builtin.command:
-    argv: [lsblk, -ndo, "SIZE,TYPE,FSTYPE", -b, "{{ vol.device }}"]
+    argv: [lsblk, -ndb, -P, -o, "SIZE,TYPE", "{{ vol.device }}"]
   register: storage_dev_info
   changed_when: false
 
+- name: Probe for filesystem and partition-table signatures on {{ vol.device }}
+  ansible.builtin.command:
+    argv: [blkid, -p, -o, export, "{{ vol.device }}"]
+  register: storage_dev_probe
+  changed_when: false
+  failed_when: storage_dev_probe.rc not in [0, 2]
+
 - name: Parse device facts for {{ vol.device }}
   ansible.builtin.set_fact:
-    storage_dev_size_gib: "{{ (storage_dev_info.stdout.split()[0] | int) / 1073741824 }}"
-    storage_dev_type: "{{ storage_dev_info.stdout.split()[1] }}"
-    storage_dev_fstype: "{{ storage_dev_info.stdout.split()[2] | default('') }}"
+    storage_dev_size_gib: "{{ (storage_dev_info.stdout | regex_search('SIZE=\"([^\"]*)\"', '\\1') | first | int) / 1073741824 }}"
+    storage_dev_type: "{{ storage_dev_info.stdout | regex_search('TYPE=\"([^\"]*)\"', '\\1') | first }}"
+    storage_dev_fstype: "{{ storage_dev_probe.stdout | regex_search('^TYPE=(.*)$', '\\1', multiline=True) | default([''], true) | first }}"
+    storage_dev_pttype: "{{ storage_dev_probe.stdout | regex_search('^PTTYPE=(.*)$', '\\1', multiline=True) | default([''], true) | first }}"
 
 - name: Guard against the wrong disk on {{ vol.device }}
   ansible.builtin.assert:
     that:
       - storage_dev_type == 'disk'
       - storage_dev_size_gib | float >= vol.min_size_gib | float
+      - storage_dev_pttype == ''
       - storage_dev_fstype in ['', 'LVM2_member']
     fail_msg: >-
       Refusing to touch {{ vol.device }}: type={{ storage_dev_type }} size={{ storage_dev_size_gib }}GiB
-      fstype='{{ storage_dev_fstype }}' (expected a blank disk >= {{ vol.min_size_gib }} GiB or our own PV).
+      fstype='{{ storage_dev_fstype }}' pttype='{{ storage_dev_pttype }}'
+      (expected a whole blank disk >= {{ vol.min_size_gib }} GiB with no partition table, or our own PV).
     quiet: true
 
 - name: Check that an existing PV belongs to our VG on {{ vol.device }}

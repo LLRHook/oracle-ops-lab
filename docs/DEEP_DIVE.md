@@ -516,9 +516,10 @@ trusting the file, and the evidence file shows `pmon`'s `/proc/<pid>/limits`.
 
 The three extra disks arrive blank as `/dev/vdb` (20 GiB), `/dev/vdc` (4 GiB), `/dev/vdd`
 (20 GiB). Lima/vz exposes no serial numbers, so the role addresses them by path and
-protects itself: for each device it reads size, type and filesystem signature with
-`lsblk` and refuses to continue unless the device is a whole disk, at least the expected
-size, and carries either no signature or the LVM signature of the volume group it manages.
+protects itself: for each device it reads size and type with `lsblk`, probes for
+filesystem and partition-table signatures with `blkid -p`, and refuses to continue unless
+the device is a whole disk, at least the expected size, has no partition table, and
+carries either no filesystem signature or the LVM signature of the volume group it manages.
 Then: `pvcreate`+`vgcreate` (`community.general.lvg`), one logical volume using 100 % of the
 group (`lvol`), `mkfs.xfs` (`filesystem`), a mount point, an `fstab` entry and mount
 (`ansible.posix.mount` with `noatime,nodiratime`), and ownership `oracle:oinstall 0750`.
@@ -886,28 +887,40 @@ passwd entry is the primary GID, so the `hugetlb_shm_group` check is tied to the
 ### 4.4 Storage guard (`roles/storage/tasks/volume.yml`)
 
 ```yaml
-- name: Read device size, type and signature of {{ vol.device }}
+- name: Read device size and type of {{ vol.device }}
   ansible.builtin.command:
-    argv: [lsblk, -ndo, "SIZE,TYPE,FSTYPE", -b, "{{ vol.device }}"]
+    argv: [lsblk, -ndb, -P, -o, "SIZE,TYPE", "{{ vol.device }}"]
   register: storage_dev_info
   changed_when: false
+
+- name: Probe for filesystem and partition-table signatures on {{ vol.device }}
+  ansible.builtin.command:
+    argv: [blkid, -p, -o, export, "{{ vol.device }}"]
+  register: storage_dev_probe
+  changed_when: false
+  failed_when: storage_dev_probe.rc not in [0, 2]
 
 - name: Guard against the wrong disk on {{ vol.device }}
   ansible.builtin.assert:
     that:
       - storage_dev_type == 'disk'
       - storage_dev_size_gib | float >= vol.min_size_gib | float
+      - storage_dev_pttype == ''
       - storage_dev_fstype in ['', 'LVM2_member']
 ```
 
-`lsblk -n` (no header) `-d` (the device only, not children) `-o` (columns) `-b` (bytes).
-A blank disk has an empty FSTYPE; after the first run it reads `LVM2_member`, and a second
-block then checks `pvs -o vg_name` returns *our* VG. Anything else (an ext4 signature, a
-foreign VG) stops the play before `pvcreate` can destroy it; a disk carrying only a
-partition table is not caught by this check (`lsblk` reports that in `PTTYPE`, not
-`FSTYPE`), so that case is left to `pvcreate`'s own refusal. The rest
-of the file is the declarative chain `lvg -> lvol (100%VG) -> filesystem xfs -> file
-(mountpoint) -> mount (fstab + mounted) -> file (owner oracle)`.
+`lsblk -n` (no header) `-d` (the device only, not children) `-b` (bytes) `-P` (one
+`KEY="value"` pair per column). `blkid -p` probes the device itself rather than reading
+the udev database, which is what `lsblk`'s FSTYPE/PTTYPE columns come from; on this VM a
+RAM disk given a GPT label showed `PTTYPE=""` in `lsblk` (udev does not probe `ram*`)
+while `blkid -p` reported `PTTYPE=gpt`. `-o export` prints `KEY=value` lines; a blank
+disk prints nothing and exits 2, which the task accepts. The parse pulls `TYPE=` (the
+filesystem or LVM signature) and `PTTYPE=` (a partition table). After the first run
+`TYPE` reads `LVM2_member`, and a second block then checks `pvs -o vg_name` returns *our*
+VG. A filesystem signature, a partition table or a foreign VG stops the play before
+`pvcreate` can destroy anything. The rest of the file is the declarative chain `lvg ->
+lvol (100%VG) -> filesystem xfs -> file (mountpoint) -> mount (fstab + mounted) -> file
+(owner oracle)`.
 
 ### 4.5 Database parameters (`roles/oracle_db/tasks/parameters.yml`)
 
