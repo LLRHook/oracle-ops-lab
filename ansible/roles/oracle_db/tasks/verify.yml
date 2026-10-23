@@ -1,0 +1,44 @@
+---
+- name: Read CDB and PDB open modes
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/oraops-sql
+      - |
+        select 'CDB ' || name || ' ' || open_mode from v$database;
+        select 'PDB ' || name || ' ' || open_mode from v$pdbs;
+        select 'use_large_pages=' || value from v$parameter where name = 'use_large_pages';
+        select 'log_mode=' || log_mode from v$database;
+        select 'sga_bytes=' || bytes from v$sgainfo where name = 'Maximum SGA Size';
+  become: true
+  become_user: "{{ oracle_user }}"
+  register: oracle_db_state
+  changed_when: false
+
+- name: Read huge page counters
+  ansible.builtin.command:
+    argv: [awk, '/^HugePages_(Total|Free|Rsvd)|^Hugepagesize/ {printf "%s %s\n", $1, $2}', /proc/meminfo]
+  register: oracle_db_hp
+  changed_when: false
+
+- name: Show database state and huge page usage
+  ansible.builtin.debug:
+    msg: "{{ oracle_db_state.stdout_lines + oracle_db_hp.stdout_lines }}"
+
+- name: Assert CDB and PDB are open, ARCHIVELOG on, and the SGA sits in huge pages
+  vars:
+    oracle_db_hp_map: "{{ dict(oracle_db_hp.stdout_lines | map('regex_replace', ':', '') | map('split', ' ')) }}"
+    oracle_db_sga_bytes: "{{ oracle_db_state.stdout_lines | select('match', '^sga_bytes=') | first | split('=') | last }}"
+    oracle_db_hp_in_use: >-
+      {{ (oracle_db_hp_map['HugePages_Total'] | int) - (oracle_db_hp_map['HugePages_Free'] | int)
+         + (oracle_db_hp_map['HugePages_Rsvd'] | int) }}
+  ansible.builtin.assert:
+    that:
+      - "'CDB ' ~ oracle_sid ~ ' READ WRITE' in oracle_db_state.stdout"
+      - "'PDB ' ~ oracle_pdb ~ ' READ WRITE' in oracle_db_state.stdout"
+      - "'use_large_pages=ONLY' in oracle_db_state.stdout"
+      - "'log_mode=ARCHIVELOG' in oracle_db_state.stdout"
+      # pages in use (allocated + reserved) must cover the SGA the instance actually built
+      # (v$sgainfo 'Maximum SGA Size' is slightly below sga_max_size after granule rounding)
+      - (oracle_db_hp_in_use | int) * (oracle_db_hp_map['Hugepagesize'] | int) * 1024 >= (oracle_db_sga_bytes | int)
+    fail_msg: "Database not in the expected state: {{ oracle_db_state.stdout_lines }} / {{ oracle_db_hp.stdout_lines }}"
+    quiet: true

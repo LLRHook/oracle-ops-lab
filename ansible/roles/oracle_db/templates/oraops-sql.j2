@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# {{ ansible_managed }}
+# oraops-sql: run SQL as SYSDBA with machine-friendly output (no headers, no feedback).
+# Must run as the oracle OS user (OS authentication: "/ as sysdba").
+#   oraops-sql "select name from v\$database"
+#   oraops-sql -p {{ oracle_pdb }} "select count(*) from dba_users"
+#   oraops-sql -f /path/to/script.sql
+# Non-zero exit on any SQL error (whenever sqlerror exit failure).
+set -uo pipefail
+export ORACLE_HOME={{ oracle_home }}
+export ORACLE_SID={{ oracle_sid }}
+export ORACLE_BASE={{ oracle_base }}
+export PATH="$ORACLE_HOME/bin:$PATH"
+export NLS_LANG=AMERICAN_AMERICA.AL32UTF8
+export NLS_DATE_FORMAT='YYYY-MM-DD HH24:MI:SS'
+
+pdb=""
+file=""
+while getopts "p:f:" opt; do
+  case "$opt" in
+    p) pdb="$OPTARG" ;;
+    f) file="$OPTARG" ;;
+    *) echo "usage: oraops-sql [-p PDB] [-f file.sql] [SQL]" >&2; exit 2 ;;
+  esac
+done
+shift $((OPTIND - 1))
+sql="${1:-}"
+
+{
+  echo "whenever sqlerror exit failure"
+  echo "whenever oserror exit failure"
+  echo "set pagesize 0 feedback off heading off verify off echo off linesize 32767 trimspool on tab off"
+  if [[ -n "$pdb" ]]; then echo "alter session set container=$pdb;"; fi
+  if [[ -n "$file" ]]; then
+    cat "$file"
+  else
+    # A single-line statement passed inline gets its terminator added so callers
+    # can write plain SQL; multi-line scripts and @file calls are passed through.
+    if [[ "$sql" != *$'\n'* && "$sql" != @* && "$sql" != *';' && "$sql" != *'/' ]]; then
+      sql="${sql};"
+    fi
+    printf '%s\n' "$sql"
+  fi
+  echo
+  echo "exit"
+} | "$ORACLE_HOME/bin/sqlplus" -S / as sysdba

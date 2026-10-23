@@ -1,0 +1,79 @@
+---
+- name: Download the Oracle Database Free RPM (checksum-verified; skipped if present)
+  ansible.builtin.get_url:
+    url: "{{ oracle_free_rpm_url }}"
+    dest: "/var/tmp/{{ oracle_free_rpm_file }}"
+    checksum: "sha256:{{ oracle_free_rpm_sha256 }}"
+    owner: root
+    group: root
+    mode: "0644"
+    timeout: 120
+
+- name: Install Oracle Database Free from the local RPM
+  ansible.builtin.dnf:
+    name: "/var/tmp/{{ oracle_free_rpm_file }}"
+    state: present
+    disable_gpg_check: true
+
+- name: Check whether the database has already been created
+  ansible.builtin.stat:
+    path: "{{ oracle_home }}/dbs/spfile{{ oracle_sid }}.ora"
+  register: oracle_db_spfile
+
+# Vendor-script defect (oracle-ai-database-free-26ai 23.26.3): the init script passes its
+# command strings to `su -c` and `bash -c` *unquoted* (`-c $1`, `-c $DBCA_CLI`), so the
+# shell word-splits them and only the first word is executed ("mkdir: missing operand",
+# dbca called with no arguments). Quoting the argument restores the intended behaviour.
+# The regexes no longer match once quoted, so this is idempotent and survives re-runs.
+- name: Quote the command arguments in the vendor configure script (23.26.3 word-splitting defect)
+  ansible.builtin.replace:
+    path: "/etc/init.d/{{ oracle_service }}"
+    regexp: '{{ item.regexp }}'
+    replace: '{{ item.replace }}'
+  loop:
+    - { regexp: '-c +\$1\s*$', replace: '-c "$1"' }
+    - { regexp: '-c +\$DBCA_CLI\s*$', replace: '-c "$DBCA_CLI"' }
+  loop_control:
+    label: "{{ item.regexp }}"
+
+- name: Point the configure script at the data volume and fix the listener port
+  ansible.builtin.lineinfile:
+    path: "{{ oracle_sysconfig }}"
+    regexp: "^{{ item.key }}="
+    line: "{{ item.key }}={{ item.value }}"
+  loop:
+    - { key: LISTENER_PORT, value: "{{ oracle_listener_port }}" }
+    - { key: CHARSET, value: "{{ oracle_charset }}" }
+    - { key: DBFILE_DEST, value: "{{ oracle_data_dir }}" }
+  loop_control:
+    label: "{{ item.key }}"
+  when: not oracle_db_spfile.stat.exists
+
+- name: Create the database (netca + dbca via the vendor configure script; 10-20 min on arm64)
+  ansible.builtin.command:
+    argv: ["/etc/init.d/{{ oracle_service }}", configure]
+  environment:
+    ORACLE_PASSWORD: "{{ oracle_sys_password }}"
+  when: not oracle_db_spfile.stat.exists
+  register: oracle_db_configure
+  async: 3600
+  poll: 30
+  changed_when: true
+  no_log: true
+
+- name: Record the configure output (password is never printed by the script)
+  ansible.builtin.copy:
+    dest: /var/log/oracle-ops-lab/configure.log
+    content: "{{ oracle_db_configure.stdout | default('') }}\n{{ oracle_db_configure.stderr | default('') }}\n"
+    owner: root
+    group: root
+    mode: "0600"
+  when: not oracle_db_spfile.stat.exists
+
+- name: Fail loudly if the configure script reported a problem
+  ansible.builtin.assert:
+    that:
+      - "'Database creation complete' in (oracle_db_configure.stdout | default(''))"
+    fail_msg: "configure did not finish cleanly; see /var/log/oracle-ops-lab/configure.log and {{ oracle_base }}/cfgtoollogs/dbca/{{ oracle_sid }}/"
+    quiet: true
+  when: not oracle_db_spfile.stat.exists

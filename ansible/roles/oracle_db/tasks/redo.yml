@@ -1,0 +1,62 @@
+---
+- name: Create the redo directory for this database
+  ansible.builtin.file:
+    path: "{{ oracle_redo_dir }}/{{ oracle_sid }}"
+    state: directory
+    owner: "{{ oracle_user }}"
+    group: "{{ oracle_group }}"
+    mode: "0750"
+
+- name: List redo log members that are not on the redo volume
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/oraops-sql
+      - "select member from v$logfile where member not like '{{ oracle_redo_dir }}/{{ oracle_sid }}/%' order by 1"
+  become: true
+  become_user: "{{ oracle_user }}"
+  register: oracle_db_old_redo
+  changed_when: false
+
+- name: Relocate online redo logs
+  when: oracle_db_old_redo.stdout_lines | length > 0
+  block:
+    - name: Copy the relocation script
+      ansible.builtin.copy:
+        src: relocate_redo.sql
+        dest: "{{ oracle_base }}/admin/{{ oracle_sid }}/relocate_redo.sql"
+        owner: "{{ oracle_user }}"
+        group: "{{ oracle_group }}"
+        mode: "0640"
+
+    - name: Add new groups on the redo volume, cycle and drop the old ones
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/oraops-sql
+          - >-
+            @{{ oracle_base }}/admin/{{ oracle_sid }}/relocate_redo.sql
+            {{ oracle_redo_dir }}/{{ oracle_sid }} {{ oracle_redo_size_mb }} {{ oracle_redo_groups }}
+      become: true
+      become_user: "{{ oracle_user }}"
+      register: oracle_db_redo_move
+      changed_when: true
+
+    - name: Show the relocation log
+      ansible.builtin.debug:
+        var: oracle_db_redo_move.stdout_lines
+
+    - name: Remove the dropped redo files from the data volume
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop: "{{ oracle_db_old_redo.stdout_lines | map('trim') | list }}"
+
+- name: Confirm every redo member is on the redo volume
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/oraops-sql
+      - "select count(*) from v$logfile where member not like '{{ oracle_redo_dir }}/{{ oracle_sid }}/%'"
+  become: true
+  become_user: "{{ oracle_user }}"
+  register: oracle_db_redo_check
+  changed_when: false
+  failed_when: oracle_db_redo_check.stdout | trim != '0'

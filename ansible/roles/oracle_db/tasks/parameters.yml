@@ -1,0 +1,128 @@
+---
+- name: Create the FRA directory for this database
+  ansible.builtin.file:
+    path: "{{ oracle_fra_dir }}/{{ oracle_sid }}"
+    state: directory
+    owner: "{{ oracle_user }}"
+    group: "{{ oracle_group }}"
+    mode: "0750"
+
+- name: Read the instance parameters we manage
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/oraops-sql
+      # folded scalar: keep every line at the same indentation so it folds to ONE line
+      # (a more-indented line keeps its newline, and oraops-sql only terminates single-line SQL)
+      - >-
+        select name || '=' || nvl(value, '') from v$parameter
+        where name in ('sga_max_size','sga_target','pga_aggregate_target','use_large_pages',
+        'memory_target','memory_max_target','db_recovery_file_dest','db_recovery_file_dest_size')
+        order by name
+  become: true
+  become_user: "{{ oracle_user }}"
+  register: oracle_db_params_raw
+  changed_when: false
+
+- name: Parse parameters into a dictionary
+  ansible.builtin.set_fact:
+    oracle_db_params: "{{ dict(oracle_db_params_raw.stdout_lines | map('split', '=', 1)) }}"
+    oracle_db_desired:
+      sga_max_size: "{{ (oracle_sga_mb | int) * 1048576 }}"
+      sga_target: "{{ (oracle_sga_mb | int) * 1048576 }}"
+      pga_aggregate_target: "{{ (oracle_pga_mb | int) * 1048576 }}"
+      use_large_pages: ONLY
+      memory_target: "0"
+      memory_max_target: "0"
+      db_recovery_file_dest: "{{ oracle_fra_dir }}/{{ oracle_sid }}"
+      db_recovery_file_dest_size: "{{ (oracle_fra_size_mb | int) * 1048576 }}"
+
+- name: Show current vs desired parameters
+  ansible.builtin.debug:
+    msg:
+      current: "{{ oracle_db_params }}"
+      desired: "{{ oracle_db_desired }}"
+
+- name: Compute which managed parameters drift from the desired values
+  ansible.builtin.set_fact:
+    oracle_db_drift: >-
+      {%- set ns = namespace(d=[]) -%}
+      {%- for k, v in oracle_db_desired.items() -%}
+        {%- if (oracle_db_params[k] | default('')) | string != v | string -%}
+          {%- set ns.d = ns.d + [k] -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ ns.d | to_json }}
+
+- name: Show drift
+  ansible.builtin.debug:
+    msg: "Parameters to change: {{ oracle_db_drift | from_json }}"
+
+- name: Decide whether the spfile needs changes
+  ansible.builtin.set_fact:
+    oracle_db_params_changed: "{{ (oracle_db_drift | from_json) | length > 0 }}"
+
+- name: Write the parameters to the spfile (effective at the next instance start)
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/oraops-sql
+      - |
+        alter system set sga_max_size={{ oracle_sga_mb }}M scope=spfile;
+        alter system set sga_target={{ oracle_sga_mb }}M scope=spfile;
+        alter system set pga_aggregate_target={{ oracle_pga_mb }}M scope=spfile;
+        alter system set memory_target=0 scope=spfile;
+        alter system set memory_max_target=0 scope=spfile;
+        alter system set use_large_pages=ONLY scope=spfile;
+        alter system set db_recovery_file_dest_size={{ oracle_fra_size_mb }}M scope=spfile;
+        alter system set db_recovery_file_dest='{{ oracle_fra_dir }}/{{ oracle_sid }}' scope=spfile;
+  become: true
+  become_user: "{{ oracle_user }}"
+  when: oracle_db_params_changed | bool
+  changed_when: true
+
+# Parameters that this release flags as deprecated but that are explicitly set in the
+# spfile (the instance then logs ORA-32004 at every start). pre_page_sga is one in 26ai.
+- name: List explicitly set parameters that this release deprecates
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/oraops-sql
+      - "select name from v$parameter where isdeprecated = 'TRUE' and isdefault = 'FALSE'"
+  become: true
+  become_user: "{{ oracle_user }}"
+  register: oracle_db_deprecated
+  changed_when: false
+
+- name: Reset deprecated parameters in the spfile
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/oraops-sql
+      - "alter system reset {{ item }} scope=spfile"
+  become: true
+  become_user: "{{ oracle_user }}"
+  loop: "{{ oracle_db_deprecated.stdout_lines | map('trim') | select('match', '^[a-z_]+$') | list }}"
+  changed_when: true
+
+- name: Restart the database so the memory parameters take effect
+  ansible.builtin.systemd_service:
+    name: "{{ oracle_service }}"
+    state: restarted
+  when: oracle_db_params_changed | bool or (oracle_db_deprecated.stdout_lines | length > 0)
+
+- name: Keep the PDB opening automatically after instance restarts
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/oraops-sql
+      - "select count(*) from dba_pdb_saved_states where con_name = '{{ oracle_pdb }}' and state = 'OPEN'"
+  become: true
+  become_user: "{{ oracle_user }}"
+  register: oracle_db_saved_state
+  changed_when: false
+
+- name: Save the PDB open state
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/oraops-sql
+      - "alter pluggable database {{ oracle_pdb }} save state"
+  become: true
+  become_user: "{{ oracle_user }}"
+  when: oracle_db_saved_state.stdout | trim == '0'
+  changed_when: true

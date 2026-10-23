@@ -1,0 +1,45 @@
+---
+- name: Read the database log mode
+  ansible.builtin.command:
+    argv: [/usr/local/bin/oraops-sql, "select log_mode from v$database"]
+  become: true
+  become_user: "{{ oracle_user }}"
+  register: oracle_db_log_mode
+  changed_when: false
+
+- name: Switch to ARCHIVELOG mode (requires a clean shutdown and a MOUNT-state change)
+  when: oracle_db_log_mode.stdout | trim != 'ARCHIVELOG'
+  block:
+    - name: Stop the database service
+      ansible.builtin.systemd_service:
+        name: "{{ oracle_service }}"
+        state: stopped
+
+    # Open after switching so the final SHUTDOWN IMMEDIATE is clean (a mounted-only
+    # database answers ORA-01109 to the CLOSE step, which SQL*Plus reports as an error).
+    - name: Mount, enable ARCHIVELOG, open, shut down cleanly
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/oraops-sql
+          - |
+            startup mount
+            alter database archivelog;
+            alter database open;
+            shutdown immediate
+      become: true
+      become_user: "{{ oracle_user }}"
+      changed_when: true
+
+    - name: Start the database service
+      ansible.builtin.systemd_service:
+        name: "{{ oracle_service }}"
+        state: started
+
+    - name: Confirm ARCHIVELOG mode
+      ansible.builtin.command:
+        argv: [/usr/local/bin/oraops-sql, "select log_mode from v$database"]
+      become: true
+      become_user: "{{ oracle_user }}"
+      register: oracle_db_log_mode_after
+      changed_when: false
+      failed_when: oracle_db_log_mode_after.stdout | trim != 'ARCHIVELOG'

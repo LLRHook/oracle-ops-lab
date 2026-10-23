@@ -1,0 +1,26 @@
+---
+- name: Install the database software and create the database
+  ansible.builtin.import_tasks: install.yml
+
+- name: Install the SYSDBA helper
+  ansible.builtin.template:
+    src: oraops-sql.j2
+    dest: /usr/local/bin/oraops-sql
+    owner: root
+    group: "{{ oracle_group }}"
+    mode: "0755"
+
+- name: Wire the database service to its volumes and enable it at boot
+  ansible.builtin.import_tasks: service.yml
+
+- name: Configure memory, large pages and the fast recovery area
+  ansible.builtin.import_tasks: parameters.yml
+
+- name: Enable ARCHIVELOG mode
+  ansible.builtin.import_tasks: archivelog.yml
+
+- name: Place online redo logs on the redo volume
+  ansible.builtin.import_tasks: redo.yml
+
+- name: Verify the instance is open and using huge pages
+  ansible.builtin.import_tasks: verify.yml

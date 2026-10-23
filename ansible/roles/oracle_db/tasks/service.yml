@@ -1,0 +1,41 @@
+---
+# The RPM ships a SysV init script; systemd wraps it through systemd-sysv-generator.
+# A drop-in adds what the generator cannot know: the service must not start before the
+# database volumes are mounted, and a cold start can take longer than the default 90 s.
+- name: Create the service drop-in directory
+  ansible.builtin.file:
+    path: "/etc/systemd/system/{{ oracle_service }}.service.d"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Order the database service after its volumes
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/{{ oracle_service }}.service.d/10-oracle-ops-lab.conf"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by Ansible (oracle-ops-lab)
+      [Unit]
+      RequiresMountsFor={{ oracle_data_dir }} {{ oracle_redo_dir }} {{ oracle_fra_dir }}
+
+      [Service]
+      TimeoutStartSec=600
+      TimeoutStopSec=600
+  notify: Reload systemd
+
+- name: Flush handlers so the drop-in is active before the service is touched
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable the database service at boot
+  ansible.builtin.systemd_service:
+    name: "{{ oracle_service }}"
+    enabled: true
+    daemon_reload: true
+
+- name: Ensure the database service is running
+  ansible.builtin.systemd_service:
+    name: "{{ oracle_service }}"
+    state: started
