@@ -5,6 +5,8 @@
 #   oraops-sql "select name from v\$database"
 #   oraops-sql -p {{ oracle_pdb }} "select count(*) from dba_users"
 #   oraops-sql -f /path/to/script.sql
+#   oraops-sql -f -            # SQL on stdin: use this when the SQL contains a secret, so
+#                              # it never appears in the process's command line
 # Non-zero exit on any SQL error (whenever sqlerror exit failure).
 set -uo pipefail
 export ORACLE_HOME={{ oracle_home }}

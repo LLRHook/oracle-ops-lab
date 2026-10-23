@@ -805,7 +805,11 @@ stop at the first failure; section 6 and `runbooks/patching.md` discuss batch si
 `scripts/gen-secrets.sh` writes `ansible/secrets/secrets.yml` (mode 600, directory 700,
 gitignored) with two 20-character alphanumeric passwords (SYS/SYSTEM/PDBADMIN and the
 exporter account) that satisfy Oracle's complexity rule and never need quoting. `site.yml`
-loads it with `vars_files`. Tasks that handle it use `no_log: true`. Why not
+loads it with `vars_files`. Tasks that handle it use `no_log: true`, and the SQL that
+carries a password (the monitoring account, the drill's DRILL user) is fed to
+`oraops-sql -f -` on stdin rather than as an argument: `no_log` only hides Ansible's own
+output, while a command-line argument is readable by every local user in
+`/proc/<pid>/cmdline` for as long as `sqlplus` runs. Why not
 `ansible-vault`: with one controller and one target, vault adds a second secret (the vault
 password file, itself gitignored) and protects nothing more; it is the right choice when
 the encrypted file must be committed and shared. Why not a secret store: the lab has no
@@ -959,7 +963,8 @@ service, so a converged host restarts nothing.
 `-S` is silent; the `set` line strips headers and feedback so every line of output is data
 Ansible can parse; `whenever sqlerror exit failure` makes SQL errors into a non-zero exit
 code, which is what `ansible.builtin.command` needs to fail a task. `-p FREEPDB1` switches
-container first. The terminator logic exists because SQL*Plus puts an unterminated
+container first; `-f -` reads the script from stdin (`cat -`), which is how the roles pass
+SQL that contains a password. The terminator logic exists because SQL*Plus puts an unterminated
 statement into its buffer and runs nothing when the next line is blank: a `select` without
 `;` returns empty output and exit code 0, which made one converge misread "no drift" and
 "not in ARCHIVELOG mode" at the same time. Multi-line scripts and `@file arg arg` calls

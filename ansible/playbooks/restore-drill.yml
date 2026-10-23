@@ -73,25 +73,24 @@
       become_user: "{{ oracle_user }}"
       changed_when: true
 
+    # The SQL contains the DRILL password, so it goes in on stdin (`-f -`) rather than as
+    # an argument that would be visible in /proc/*/cmdline while sqlplus runs.
     - name: Create the sacrificial tablespace, a user and the marker rows, count {{ drill_rows_before }}
       ansible.builtin.command:
-        argv:
-          - /usr/local/bin/oraops-sql
-          - -p
-          - "{{ oracle_pdb }}"
-          - |
-            create tablespace {{ drill_tablespace }} datafile '{{ drill_datafile }}'
-              size 64M autoextend on next 16M maxsize 512M;
-            create user {{ drill_user }} identified by "Drill_{{ drill_stamp }}"
-              default tablespace {{ drill_tablespace }} quota unlimited on {{ drill_tablespace }};
-            create table {{ drill_user }}.marker
-              (id number primary key, phase varchar2(16), payload varchar2(64), created timestamp default systimestamp)
-              tablespace {{ drill_tablespace }};
-            insert into {{ drill_user }}.marker (id, phase, payload)
-              select level, 'before-backup', standard_hash(to_char(level), 'MD5')
-              from dual connect by level <= {{ drill_rows_before }};
-            commit;
-            select 'rows=' || count(*) || ' sum=' || sum(id) from {{ drill_user }}.marker;
+        argv: [/usr/local/bin/oraops-sql, -p, "{{ oracle_pdb }}", -f, "-"]
+        stdin: |
+          create tablespace {{ drill_tablespace }} datafile '{{ drill_datafile }}'
+            size 64M autoextend on next 16M maxsize 512M;
+          create user {{ drill_user }} identified by "Drill_{{ drill_stamp }}"
+            default tablespace {{ drill_tablespace }} quota unlimited on {{ drill_tablespace }};
+          create table {{ drill_user }}.marker
+            (id number primary key, phase varchar2(16), payload varchar2(64), created timestamp default systimestamp)
+            tablespace {{ drill_tablespace }};
+          insert into {{ drill_user }}.marker (id, phase, payload)
+            select level, 'before-backup', standard_hash(to_char(level), 'MD5')
+            from dual connect by level <= {{ drill_rows_before }};
+          commit;
+          select 'rows=' || count(*) || ' sum=' || sum(id) from {{ drill_user }}.marker;
       become: true
       become_user: "{{ oracle_user }}"
       register: drill_seed

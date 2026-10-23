@@ -7,16 +7,18 @@
   register: monitoring_db_user
   changed_when: false
 
+# The SQL carries the password, so it goes to sqlplus on stdin (`-f -`), never as a
+# command-line argument: argv is world-readable in /proc/*/cmdline while sqlplus runs,
+# and no_log only hides Ansible's own output.
 - name: Create a common (CDB-wide) read-only monitoring account
   ansible.builtin.command:
-    argv:
-      - /usr/local/bin/oraops-sql
-      - |
-        create user {{ oracledb_exporter_user }} identified by "{{ oracle_exporter_password }}" container=all;
-        grant create session to {{ oracledb_exporter_user }} container=all;
-        grant select_catalog_role to {{ oracledb_exporter_user }} container=all;
-        grant select any dictionary to {{ oracledb_exporter_user }} container=all;
-        alter user {{ oracledb_exporter_user }} set container_data=all container=current;
+    argv: [/usr/local/bin/oraops-sql, -f, "-"]
+    stdin: |
+      create user {{ oracledb_exporter_user }} identified by "{{ oracle_exporter_password }}" container=all;
+      grant create session to {{ oracledb_exporter_user }} container=all;
+      grant select_catalog_role to {{ oracledb_exporter_user }} container=all;
+      grant select any dictionary to {{ oracledb_exporter_user }} container=all;
+      alter user {{ oracledb_exporter_user }} set container_data=all container=current;
   become: true
   become_user: "{{ oracle_user }}"
   when: monitoring_db_user.stdout | trim == '0'
