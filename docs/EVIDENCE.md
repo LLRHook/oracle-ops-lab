@@ -99,7 +99,8 @@ What it took to get there (each was a real `changed` on an earlier second run,
 | `backup : Apply persistent RMAN configuration` | RMAN prints "new RMAN configuration parameters are successfully stored" on every `CONFIGURE` | compare `SHOW ALL` with the rendered `CONFIGURE` lines first; apply only when one is missing |
 
 Run 05 (after the fixes) reported `changed=1` (the new tmpfiles.d file); runs 06 and 14
-reported `changed=0`.
+reported `changed=0`. After the review fixes in section 13 the task count is 127 (one
+`blkid` probe per volume) and the run still reports `changed=0`.
 
 ## 3. Huge pages before and after instance start
 
@@ -325,28 +326,37 @@ runs a missed job after the service start); its metric is in section 9.
 
 ## 8. Restore drill (`make drill`)
 
-Report: `docs/drills/restore-drill-20261023T131702Z.md`. Key lines:
+Report: `docs/drills/restore-drill-20261023T135248Z.md` (the run after the review fixes in
+section 13; the earlier report was deleted because its excerpt here and the file came from
+different attempts). Key lines:
 
 ```
-RESTORE DATABASE VALIDATE: Finished restore at 2026-10-23 09:16:36 (4 datafile backup sets validated),
-                           archived logs: 16 scanned, Finished restore at 09:16:52; no RMAN-/ORA- errors
+RESTORE DATABASE VALIDATE: Finished restore at 2026-10-23 09:52:53 (4 datafile backup sets validated),
+                           archived logs: 20 scanned, Finished restore at 09:53:14; no RMAN-/ORA- errors
 
 | Rows before backup                | 1000 (rows=1000 sum=500500)                                   |
 | Backup                            | tag DRILL, 4 piece(s)                                          |
 | Rows after backup (redo only)     | 500 (rows=1500 sum=1125750)                                   |
 | Failure injected                  | rm /u02/oradata/FREE/FREEPDB1/drill01.dbf; buffer cache flushed; table read |
-| Observed error                    | ORA-01116: error in opening database file 18 / ORA-01110: data file 18:
+| Observed error                    | ORA-01116: error in opening database file 20 / ORA-01110: data file 20:
                                       '/u02/oradata/FREE/FREEPDB1/drill01.dbf' / ORA-27041: unable to open file |
 | Recovery                          | datafile OFFLINE; RMAN RESTORE DATAFILE + RECOVER DATAFILE; datafile ONLINE (PDB open throughout) |
 | Verified after recovery           | rows=1500 sum=1125750, after-backup=500, before-backup=1000   |
 | PDB state                         | PDB$SEED READ ONLY, FREEPDB1 READ WRITE                        |
-| RTO (read fails -> rows verified) | 2.5 s                                                         |
+| RTO (read fails -> rows verified) | 2.4 s                                                         |
 
-channel ORA_DISK_1: restoring datafile 00018 to /u02/oradata/FREE/FREEPDB1/drill01.dbf
+Starting restore at 2026-10-23 09:53:21
+channel ORA_DISK_1: restoring datafile 00020 to /u02/oradata/FREE/FREEPDB1/drill01.dbf
 channel ORA_DISK_1: restore complete, elapsed time: 00:00:01
-Starting recover at 2026-10-23 09:17:01
+Starting recover at 2026-10-23 09:53:23
 media recovery complete, elapsed time: 00:00:00
 ```
+
+The datafile number is 20 because every drill creates a new tablespace and Oracle hands out
+the next file number; earlier attempts used 18 and 19. The three RMAN logs on the host and
+the report now carry one stamp (`drill-validate-`, `drill-backup-`,
+`drill-restore-20261023T135248Z.log`, `restore-drill-20261023T135248Z.md`); before the
+stamp was fixed once per run (section 13) they differed by a few seconds.
 
 Three earlier drill attempts failed and were fixed before this one: `alter system switch
 logfile` is not allowed inside a PDB (ORA-65040; moved to the root), `alter pluggable
@@ -470,6 +480,84 @@ Second `make patch` (`evidence/raw/13-patch-second-run-no-reboot.log`), nothing 
     reboot_required: false
 PLAY RECAP: ok=17 changed=0 skipped=4 failed=0
 ```
+
+## 13. Re-verification after the review fixes
+
+Four findings from an independent review were fixed and re-run on the same VM:
+
+1. SQL that carries a password (the `C##OPSMON` account, the drill's `DRILL` user) goes to
+   `oraops-sql -f -` on stdin instead of as a command-line argument.
+2. The drill stamp is computed once with `set_fact` instead of a lazily re-evaluated
+   `vars:` pipe lookup.
+3. The storage guard probes the device with `blkid -p` and refuses a partition table.
+4. `scripts/gen-secrets.sh` reads a fixed byte count from `/dev/urandom` before filtering,
+   so `head` closing the pipe no longer kills the script under `pipefail`.
+
+Converge after the changes: `changed=1` (`oracle_db : Install the SYSDBA helper`, the
+template gained a usage comment), then `changed=0`, and `changed=0` twice more after the
+guard switched to `blkid`:
+
+```
+oradb1 : ok=124  changed=1  unreachable=0  failed=0  skipped=26  rescued=0  ignored=0
+oradb1 : ok=124  changed=0  unreachable=0  failed=0  skipped=26  rescued=0  ignored=0
+oradb1 : ok=127  changed=0  unreachable=0  failed=0  skipped=26  rescued=0  ignored=0
+oradb1 : ok=127  changed=0  unreachable=0  failed=0  skipped=26  rescued=0  ignored=0
+```
+
+Command lines sampled every 100 ms on the host (`ps -eo args`) while `make drill` ran; the
+step that creates the DRILL user shows only the flags, and the password never appears:
+
+```
+bash /usr/local/bin/oraops-sql -p FREEPDB1 -f -
+/opt/oracle/product/26ai/dbhomeFree/bin/sqlplus -S   as sysdba
+```
+
+The monitoring-account path was exercised for real by stopping the exporter, dropping the
+user and converging again (`changed=2`: the account and the exporter service), then once
+more (`changed=0`):
+
+```
+TASK [monitoring : Create a common (CDB-wide) read-only monitoring account] ****
+TASK [monitoring : Enable and start the exporter] ******************************
+oradb1 : ok=128  changed=2  unreachable=0  failed=0  skipped=25  rescued=0  ignored=0
+oradb1 : ok=127  changed=0  unreachable=0  failed=0  skipped=26  rescued=0  ignored=0
+$ curl -s localhost:9161/metrics | grep ^oracledb_up
+oracledb_up{database="default"} 1
+```
+
+Storage guard against a partition table, tested on a 1 GiB RAM disk (`modprobe brd`)
+given a GPT label with `sfdisk`. `lsblk` reports the signature from the udev database,
+which udev never fills for `ram*` devices, so the original FSTYPE/PTTYPE check would have
+passed; `blkid -p` probes the device itself:
+
+```
+$ lsblk -ndb -P -o SIZE,TYPE,FSTYPE,PTTYPE /dev/ram0
+SIZE="1073741824" TYPE="disk" FSTYPE="" PTTYPE=""
+$ blkid -p -o export /dev/ram0
+DEVNAME=/dev/ram0
+PTUUID=fddf65da-853a-a240-9173-dfa17c2a4459
+PTTYPE=gpt
+$ blkid -p -o export /dev/vdb
+DEVNAME=/dev/vdb
+UUID=IxUREQ-sWCz-kXON-xRed-MGh2-HLbG-4qU18I
+VERSION=LVM2\ 001
+TYPE=LVM2_member
+USAGE=raid
+```
+
+`volume.yml` included against `/dev/ram0` with a throw-away `vol` definition:
+
+```
+TASK [Guard against the wrong disk on /dev/ram0] *******************************
+fatal: [oradb1]: FAILED! => {"assertion": "storage_dev_pttype == ''", "changed": false, "evaluated_to": false,
+  "msg": "Refusing to touch /dev/ram0: type=disk size=1.0GiB fstype='' pttype='gpt'
+  (expected a whole blank disk >= 0.5 GiB with no partition table, or our own PV)."}
+```
+
+The RAM disk was wiped and the module removed afterwards. `scripts/gen-secrets.sh` run in
+a scratch directory with `set -euo pipefail` active wrote two 20-character values and
+exited 0. `make test` and `make lint` passed after the changes (`ok=6 changed=0`;
+`Passed: 0 failure(s), 0 warning(s) in 49 files`).
 
 ## Host disk use
 
