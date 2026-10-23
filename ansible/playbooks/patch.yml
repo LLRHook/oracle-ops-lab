@@ -1,0 +1,188 @@
+---
+# OS patching with guard rails.
+#   pre-checks  : disk headroom, database open, a recent successful backup
+#   update      : dnf (all updates, or security-only with patch_security_only=true)
+#   reboot?     : only if needs-restarting -r says the kernel/systemd/libc changed
+#   stop/start  : orderly database stop before a reboot; the service starts it again
+#   post-checks : listener, CDB/PDB open, huge pages still in use, exporters up
+#
+# `serial: 1` makes a multi-host inventory patch one database host at a time so a bad
+# update stops the rollout at the first failure instead of taking a fleet down together.
+# With max_fail_percentage: 0 the play aborts as soon as one host fails.
+- name: Patch Oracle database hosts
+  hosts: oracle_db
+  become: true
+  serial: 1
+  max_fail_percentage: 0
+  vars:
+    patch_security_only: false
+    patch_min_free_root_mb: 2048
+    patch_max_backup_age_hours: 48
+  tasks:
+    # ------------------------------------------------------------------ pre-checks
+    - name: Pre-check free space on / and the volumes Oracle writes to
+      ansible.builtin.shell:
+        cmd: "set -o pipefail; df -Pm / {{ oracle_data_dir }} {{ oracle_fra_dir }} | awk 'NR>1 {print $6\"=\"$4}'"
+      register: patch_df
+      changed_when: false
+
+    - name: Assert disk headroom
+      ansible.builtin.assert:
+        that: "patch_df.stdout_lines | map('split', '=') | map('last') | map('int') | min >= patch_min_free_root_mb"
+        fail_msg: "Not enough free space: {{ patch_df.stdout_lines }}"
+        quiet: true
+
+    - name: Pre-check database health
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/oraops-sql
+          - |
+            select 'CDB=' || open_mode from v$database;
+            select 'PDB=' || open_mode from v$pdbs where name = '{{ oracle_pdb }}';
+      become: true
+      become_user: "{{ oracle_user }}"
+      register: patch_db_pre
+      changed_when: false
+      failed_when: "'CDB=READ WRITE' not in patch_db_pre.stdout or 'PDB=READ WRITE' not in patch_db_pre.stdout"
+
+    - name: Pre-check that a successful backup exists and is recent
+      ansible.builtin.shell:
+        cmd: >-
+          set -o pipefail;
+          grep -E '^oracle_rman_backup_last_success_timestamp_seconds\{level="(level0|level1)"' {{ node_exporter_textfile_dir }}/oracle_rman_backup.prom
+          | awk '{print $NF}' | sort -n | tail -1
+      register: patch_last_backup
+      changed_when: false
+
+    - name: Assert the last successful level 0/1 backup is younger than the limit in hours, {{ patch_max_backup_age_hours }}
+      ansible.builtin.assert:
+        that:
+          - patch_last_backup.stdout | trim | length > 0
+          - (ansible_date_time.epoch | int) - (patch_last_backup.stdout | trim | int) < patch_max_backup_age_hours * 3600
+        fail_msg: "No successful backup in the last {{ patch_max_backup_age_hours }} h; run `make backup` first."
+        quiet: true
+
+    # ------------------------------------------------------------------ update
+    - name: Refresh metadata and apply updates (security only when patch_security_only is true)
+      ansible.builtin.dnf:
+        name: "*"
+        state: latest
+        update_cache: true
+        security: "{{ patch_security_only | bool }}"
+        update_only: true
+      register: patch_dnf
+
+    - name: Record what changed
+      ansible.builtin.debug:
+        msg: "{{ patch_dnf.results | default([]) | select('search', 'Installed|Upgraded|Removed') | list | length }} package actions"
+
+    - name: Ask the system whether a reboot is required (needs-restarting -r, rc 1 means yes)
+      ansible.builtin.command:
+        argv: [needs-restarting, -r]
+      register: patch_needs_reboot
+      changed_when: false
+      failed_when: patch_needs_reboot.rc not in [0, 1]
+
+    - name: List services with updated libraries (informational)
+      ansible.builtin.command:
+        argv: [needs-restarting, -s]
+      register: patch_stale_services
+      changed_when: false
+      failed_when: false
+
+    # ------------------------------------------------------------------ reboot (only if needed)
+    - name: Reboot path
+      when: patch_needs_reboot.rc == 1
+      block:
+        - name: Orderly database stop (shutdown immediate + listener stop via the service)
+          ansible.builtin.systemd_service:
+            name: "{{ oracle_service }}"
+            state: stopped
+
+        - name: Reboot
+          ansible.builtin.reboot:
+            msg: "oracle-ops-lab patching: reboot required by needs-restarting"
+            reboot_timeout: 900
+            post_reboot_delay: 15
+
+        - name: Wait for the database service to come back (RequiresMountsFor + enabled unit)
+          ansible.builtin.systemd_service:
+            name: "{{ oracle_service }}"
+            state: started
+
+    - name: Restart services with stale libraries when no reboot was needed
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        state: restarted
+      loop: "{{ patch_stale_services.stdout_lines | map('trim') | select('match', '^(node_exporter|oracledb_exporter|chronyd|firewalld)\\.service$') | list }}"
+      when: patch_needs_reboot.rc == 0
+
+    # ------------------------------------------------------------------ post-checks
+    - name: Post-check listener
+      ansible.builtin.command:
+        argv: ["{{ oracle_home }}/bin/lsnrctl", status]
+      become: true
+      become_user: "{{ oracle_user }}"
+      environment:
+        ORACLE_HOME: "{{ oracle_home }}"
+      register: patch_lsnr
+      changed_when: false
+      failed_when: "'READY' not in patch_lsnr.stdout"
+
+    - name: Post-check database open and PDB open
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/oraops-sql
+          - |
+            select 'CDB=' || open_mode from v$database;
+            select 'PDB=' || open_mode from v$pdbs where name = '{{ oracle_pdb }}';
+            select 'use_large_pages=' || value from v$parameter where name = 'use_large_pages';
+      become: true
+      become_user: "{{ oracle_user }}"
+      register: patch_db_post
+      changed_when: false
+      retries: 10
+      delay: 10
+      until: "'PDB=READ WRITE' in patch_db_post.stdout"
+
+    - name: Post-check the running kernel (facts were gathered before any reboot)
+      ansible.builtin.command:
+        argv: [uname, -r]
+      register: patch_kernel_now
+      changed_when: false
+
+    - name: Post-check huge pages still back the SGA
+      ansible.builtin.command:
+        argv: [awk, '/^HugePages_(Total|Free|Rsvd)/ {printf "%s%s ", $1, $2}', /proc/meminfo]
+      register: patch_hp
+      changed_when: false
+
+    - name: Post-check exporters
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ item }}/metrics"
+      loop: ["{{ node_exporter_port }}", "{{ oracledb_exporter_port }}"]
+      register: patch_exporters
+      retries: 6
+      delay: 5
+      until: patch_exporters.status == 200
+
+    - name: Assert post-checks
+      vars:
+        hp: "{{ dict(patch_hp.stdout.split() | map('split', ':')) }}"
+      ansible.builtin.assert:
+        that:
+          - "'CDB=READ WRITE' in patch_db_post.stdout"
+          - "'use_large_pages=ONLY' in patch_db_post.stdout"
+          - (hp['HugePages_Total'] | int) - (hp['HugePages_Free'] | int) + (hp['HugePages_Rsvd'] | int) > 0
+        fail_msg: "post-checks failed: {{ patch_db_post.stdout_lines }} {{ patch_hp.stdout }}"
+        quiet: true
+
+    - name: Patch summary
+      ansible.builtin.debug:
+        msg:
+          dnf_changed: "{{ patch_dnf.changed }}"
+          reboot_required: "{{ patch_needs_reboot.rc == 1 }}"
+          kernel_before: "{{ ansible_facts['kernel'] }}"
+          kernel_now: "{{ patch_kernel_now.stdout }}"
+          database: "{{ patch_db_post.stdout_lines }}"
+          hugepages: "{{ patch_hp.stdout }}"

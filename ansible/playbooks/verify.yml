@@ -1,0 +1,73 @@
+---
+# Read-only assertions that the host is in the state site.yml promises. Used by `make test`.
+- name: Verify the Oracle host
+  hosts: oracle_db
+  become: true
+  tasks:
+    - name: Collect kernel, THP, huge page and mount facts
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          echo "pagesize=$(getconf PAGESIZE)"
+          echo "thp=$(cat /sys/kernel/mm/transparent_hugepage/enabled)"
+          echo "cmdline_thp=$(grep -o 'transparent_hugepage=[a-z]*' /proc/cmdline)"
+          awk '/^HugePages_(Total|Free|Rsvd)|^Hugepagesize/ {printf "%s%s\n", $1, $2}' /proc/meminfo
+          echo "selinux=$(getenforce)"
+          for m in {{ oracle_data_dir }} {{ oracle_redo_dir }} {{ oracle_fra_dir }}; do echo "mount_$m=$(findmnt -no SOURCE,FSTYPE,OPTIONS $m)"; done
+          echo "timers=$(systemctl list-timers --no-legend 'oracle-rman-backup@*' | wc -l)"
+          echo "fw=$(firewall-cmd --list-ports)"
+      register: verify_os
+      changed_when: false
+
+    - name: Collect database facts
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/oraops-sql
+          - |
+            select 'cdb=' || open_mode from v$database;
+            select 'log_mode=' || log_mode from v$database;
+            select 'pdb=' || name || ':' || open_mode from v$pdbs;
+            select 'use_large_pages=' || value from v$parameter where name = 'use_large_pages';
+            select 'sga_max_mb=' || value / 1048576 from v$parameter where name = 'sga_max_size';
+            select 'sga_bytes=' || bytes from v$sgainfo where name = 'Maximum SGA Size';
+            select 'redo_off_volume=' || count(*) from v$logfile where member not like '{{ oracle_redo_dir }}/%';
+            select 'datafiles_off_volume=' || count(*) from v$datafile where name not like '{{ oracle_data_dir }}/%';
+            select 'fra=' || name from v$recovery_file_dest;
+      become: true
+      become_user: "{{ oracle_user }}"
+      register: verify_db
+      changed_when: false
+
+    - name: Scrape exporters
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ item }}/metrics"
+        return_content: true
+      loop: ["{{ node_exporter_port }}", "{{ oracledb_exporter_port }}"]
+      register: verify_exporters
+
+    - name: Show facts
+      ansible.builtin.debug:
+        msg: "{{ verify_os.stdout_lines + verify_db.stdout_lines }}"
+
+    - name: Assert the promised state
+      vars:
+        hp: "{{ dict(verify_os.stdout_lines | select('match', '^HugePages_|^Hugepagesize') | map('regex_replace', ':', '=') | map('split', '=')) }}"
+        db: "{{ dict(verify_db.stdout_lines | select('search', '=') | map('split', '=', 1)) }}"
+      ansible.builtin.assert:
+        that:
+          - "'thp=always madvise [never]' in verify_os.stdout"
+          - "'cmdline_thp=transparent_hugepage=never' in verify_os.stdout"
+          - "'selinux=Enforcing' in verify_os.stdout"
+          - "'timers=3' in verify_os.stdout"
+          - "'cdb=READ WRITE' in verify_db.stdout"
+          - "'log_mode=ARCHIVELOG' in verify_db.stdout"
+          - "'pdb=' ~ oracle_pdb ~ ':READ WRITE' in verify_db.stdout"
+          - "'use_large_pages=ONLY' in verify_db.stdout"
+          - "'redo_off_volume=0' in verify_db.stdout"
+          - "'datafiles_off_volume=0' in verify_db.stdout"
+          - >-
+            ((hp['HugePages_Total'] | int) - (hp['HugePages_Free'] | int) + (hp['HugePages_Rsvd'] | int))
+            * (hp['Hugepagesize'] | regex_replace('kB', '') | int) * 1024 >= (db['sga_bytes'] | int)
+          - verify_exporters.results[1].content is search('^oracledb_up(\\{[^}]*\\})? 1$', multiline=True)
+          - "'oracle_rman_backup_last_success_timestamp_seconds' in verify_exporters.results[0].content"
+        quiet: true

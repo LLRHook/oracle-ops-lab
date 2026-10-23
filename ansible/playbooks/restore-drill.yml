@@ -1,0 +1,294 @@
+---
+# Restore drill in two parts.
+#  (a) RESTORE DATABASE VALIDATE: RMAN reads every backup piece it would need for a
+#      full restore and checks it is complete and uncorrupted, without writing anything.
+#  (b) Destructive drill on a sacrificial tablespace in the PDB: create it, insert marker
+#      rows, back it up, insert more rows (so recovery must replay redo beyond the backup),
+#      delete its datafile at the OS level, flush the buffer cache so the next read hits
+#      disk and fails (ORA-01116/ORA-01110), then take the datafile offline, restore and
+#      recover it with RMAN, bring it online, and verify every marker row. The PDB stays
+#      open throughout: only the lost tablespace is unavailable, which is the standard
+#      single-datafile procedure. Wall-clock RTO is measured from "read fails" to
+#      "rows verified".
+# Output: docs/drills/restore-drill-<UTC timestamp>.md on the controller.
+- name: Oracle restore drill
+  hosts: oracle_db
+  become: true
+  vars:
+    drill_tablespace: DRILL
+    drill_user: DRILL
+    drill_rows_before: 1000
+    drill_rows_after: 500
+    drill_datafile: "{{ oracle_data_dir }}/{{ oracle_sid }}/{{ oracle_pdb }}/drill01.dbf"
+    drill_report_dir: "{{ playbook_dir }}/../../docs/drills"
+    drill_stamp: "{{ lookup('pipe', 'date -u +%Y%m%dT%H%M%SZ') }}"
+    drill_restore_filter: "Starting|Finished|restoring|piece handle|media recovery|archived log for thread|Statement processed|channel ORA_DISK_1: "
+    drill_nl: "\n"  # a real newline for join(); a Jinja '\n' literal would be written verbatim
+    rman_env:
+      ORACLE_HOME: "{{ oracle_home }}"
+      ORACLE_SID: "{{ oracle_sid }}"
+      ORACLE_BASE: "{{ oracle_base }}"
+      PATH: "{{ oracle_home }}/bin:/usr/local/bin:/usr/bin:/bin"
+      NLS_DATE_FORMAT: "YYYY-MM-DD HH24:MI:SS"
+  tasks:
+    # ------------------------------------------------------------------ (a)
+    - name: (a) RESTORE DATABASE VALIDATE against the current backups
+      ansible.builtin.shell:
+        cmd: >-
+          set -o pipefail;
+          printf 'RESTORE DATABASE VALIDATE;\nRESTORE ARCHIVELOG FROM TIME "SYSDATE-1" VALIDATE;\n'
+          | rman target / | tee {{ rman_log_dir }}/drill-validate-{{ drill_stamp }}.log
+      become: true
+      become_user: "{{ oracle_user }}"
+      environment: "{{ rman_env }}"
+      register: drill_validate
+      changed_when: false
+      failed_when: "'RMAN-' in drill_validate.stdout or 'ORA-' in drill_validate.stdout or 'Finished restore' not in drill_validate.stdout"
+
+    # ------------------------------------------------------------------ (b) setup
+    - name: Reset any leftover drill tablespace from a previous run
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/oraops-sql
+          - -p
+          - "{{ oracle_pdb }}"
+          - |
+            declare n number;
+            begin
+              select count(*) into n from dba_tablespaces where tablespace_name = '{{ drill_tablespace }}';
+              if n > 0 then
+                -- an aborted drill may have left the file deleted: offline it first so the drop
+                -- does not need to open it (ORA-01116)
+                begin
+                  execute immediate 'alter database datafile ''{{ drill_datafile }}'' offline for drop';
+                exception when others then null;
+                end;
+                execute immediate 'drop tablespace {{ drill_tablespace }} including contents and datafiles';
+              end if;
+              select count(*) into n from dba_users where username = '{{ drill_user }}';
+              if n > 0 then execute immediate 'drop user {{ drill_user }} cascade'; end if;
+            end;
+            /
+      become: true
+      become_user: "{{ oracle_user }}"
+      changed_when: true
+
+    - name: Create the sacrificial tablespace, a user and the marker rows, count {{ drill_rows_before }}
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/oraops-sql
+          - -p
+          - "{{ oracle_pdb }}"
+          - |
+            create tablespace {{ drill_tablespace }} datafile '{{ drill_datafile }}'
+              size 64M autoextend on next 16M maxsize 512M;
+            create user {{ drill_user }} identified by "Drill_{{ drill_stamp }}"
+              default tablespace {{ drill_tablespace }} quota unlimited on {{ drill_tablespace }};
+            create table {{ drill_user }}.marker
+              (id number primary key, phase varchar2(16), payload varchar2(64), created timestamp default systimestamp)
+              tablespace {{ drill_tablespace }};
+            insert into {{ drill_user }}.marker (id, phase, payload)
+              select level, 'before-backup', standard_hash(to_char(level), 'MD5')
+              from dual connect by level <= {{ drill_rows_before }};
+            commit;
+            select 'rows=' || count(*) || ' sum=' || sum(id) from {{ drill_user }}.marker;
+      become: true
+      become_user: "{{ oracle_user }}"
+      register: drill_seed
+      changed_when: true
+
+    - name: Back up the drill tablespace (level 0) plus archived logs
+      ansible.builtin.shell:
+        cmd: >-
+          set -o pipefail;
+          printf "BACKUP INCREMENTAL LEVEL 0 TABLESPACE {{ oracle_pdb }}:{{ drill_tablespace }} TAG 'DRILL' PLUS ARCHIVELOG NOT BACKED UP 1 TIMES;\n"
+          | rman target / | tee {{ rman_log_dir }}/drill-backup-{{ drill_stamp }}.log
+      become: true
+      become_user: "{{ oracle_user }}"
+      environment: "{{ rman_env }}"
+      register: drill_backup
+      changed_when: true
+      failed_when: "'RMAN-' in drill_backup.stdout or 'ORA-' in drill_backup.stdout"
+
+    - name: Insert more rows after the backup, count {{ drill_rows_after }}
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/oraops-sql
+          - -p
+          - "{{ oracle_pdb }}"
+          - |
+            insert into {{ drill_user }}.marker (id, phase, payload)
+              select {{ drill_rows_before }} + level, 'after-backup', standard_hash(to_char(level), 'MD5')
+              from dual connect by level <= {{ drill_rows_after }};
+            commit;
+            select 'rows=' || count(*) || ' sum=' || sum(id) from {{ drill_user }}.marker;
+      become: true
+      become_user: "{{ oracle_user }}"
+      register: drill_expected
+      changed_when: true
+
+    # Log switch and checkpoint are instance-wide operations: they must run in the CDB root
+    # (inside a PDB they fail with ORA-65040). The after-backup rows now exist only in redo.
+    - name: Switch the online log and checkpoint from the CDB root
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/oraops-sql
+          - |
+            alter system switch logfile;
+            alter system checkpoint;
+      become: true
+      become_user: "{{ oracle_user }}"
+      changed_when: true
+
+    # ------------------------------------------------------------------ (b) break
+    - name: Delete the datafile at the OS level (the failure)
+      ansible.builtin.file:
+        path: "{{ drill_datafile }}"
+        state: absent
+
+    # The blocks are still in the buffer cache, so a query would succeed from memory and
+    # hide the loss; flushing the cache (CDB root) forces the next read to the missing file.
+    - name: Flush the buffer cache so the next read must touch the lost file
+      ansible.builtin.command:
+        argv: [/usr/local/bin/oraops-sql, "alter system flush buffer_cache"]
+      become: true
+      become_user: "{{ oracle_user }}"
+      changed_when: true
+
+    - name: Read the marker table (expected to fail with ORA-01116/ORA-01110 on the lost file)
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/oraops-sql
+          - -p
+          - "{{ oracle_pdb }}"
+          - "select count(*) from {{ drill_user }}.marker"
+      become: true
+      become_user: "{{ oracle_user }}"
+      register: drill_failure
+      changed_when: false
+      failed_when: "'ORA-01110' not in drill_failure.stdout"
+
+    - name: Start the RTO clock
+      ansible.builtin.set_fact:
+        drill_t0: "{{ lookup('pipe', 'date +%s.%N') }}"
+
+    # ------------------------------------------------------------------ (b) fix
+    - name: Take the lost datafile offline so RMAN can restore it while the PDB stays open
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/oraops-sql
+          - -p
+          - "{{ oracle_pdb }}"
+          - "alter database datafile '{{ drill_datafile }}' offline"
+      become: true
+      become_user: "{{ oracle_user }}"
+      changed_when: true
+
+    - name: Restore and recover the lost datafile with RMAN
+      ansible.builtin.shell:
+        cmd: >-
+          set -o pipefail;
+          printf "%s\n" "RUN {" "RESTORE DATAFILE '{{ drill_datafile }}';" "RECOVER DATAFILE '{{ drill_datafile }}';" "}"
+          | rman target / | tee {{ rman_log_dir }}/drill-restore-{{ drill_stamp }}.log
+      become: true
+      become_user: "{{ oracle_user }}"
+      environment: "{{ rman_env }}"
+      register: drill_restore
+      changed_when: true
+      failed_when: "'RMAN-' in drill_restore.stdout or 'ORA-' in drill_restore.stdout"
+
+    - name: Bring the recovered datafile back online
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/oraops-sql
+          - -p
+          - "{{ oracle_pdb }}"
+          - "alter database datafile '{{ drill_datafile }}' online"
+      become: true
+      become_user: "{{ oracle_user }}"
+      changed_when: true
+
+    - name: Verify every marker row is back (including the rows inserted after the backup)
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/oraops-sql
+          - -p
+          - "{{ oracle_pdb }}"
+          - |
+            select 'rows=' || count(*) || ' sum=' || sum(id) from {{ drill_user }}.marker;
+            select phase || '=' || count(*) from {{ drill_user }}.marker group by phase order by 1;
+      become: true
+      become_user: "{{ oracle_user }}"
+      register: drill_verify
+      changed_when: false
+
+    - name: Stop the RTO clock
+      ansible.builtin.set_fact:
+        drill_t1: "{{ lookup('pipe', 'date +%s.%N') }}"
+        drill_rto_seconds: "{{ (lookup('pipe', 'date +%s.%N') | float) - (drill_t0 | float) }}"
+
+    - name: Assert the data matches what was committed before the failure
+      ansible.builtin.assert:
+        that:
+          - drill_verify.stdout_lines[0] == drill_expected.stdout_lines[-1]
+          - "'after-backup=' ~ drill_rows_after in drill_verify.stdout"
+        fail_msg: "expected {{ drill_expected.stdout_lines[-1] }}, got {{ drill_verify.stdout_lines }}"
+        quiet: true
+
+    - name: Read the PDB open mode after recovery
+      ansible.builtin.command:
+        argv: [/usr/local/bin/oraops-sql, "select name || ' ' || open_mode from v$pdbs"]
+      become: true
+      become_user: "{{ oracle_user }}"
+      register: drill_pdb_state
+      changed_when: false
+
+    # ------------------------------------------------------------------ report
+    - name: Write the drill report on the controller
+      ansible.builtin.copy:
+        dest: "{{ drill_report_dir }}/restore-drill-{{ drill_stamp }}.md"
+        mode: "0644"
+        content: |
+          # Restore drill {{ drill_stamp }}
+
+          Host `{{ inventory_hostname }}` ({{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }},
+          kernel {{ ansible_facts['kernel'] }}),
+          database `{{ oracle_sid }}` / PDB `{{ oracle_pdb }}`.
+
+          ## (a) RESTORE DATABASE VALIDATE
+
+          ```
+          {{ drill_validate.stdout_lines | select('search', 'channel|Finished|Starting|validation|piece handle') | list | join(drill_nl) }}
+          ```
+
+          ## (b) Lost datafile drill
+
+          | Step | Result |
+          |---|---|
+          | Tablespace / datafile | `{{ drill_tablespace }}` / `{{ drill_datafile }}` |
+          | Rows before backup | {{ drill_rows_before }} ({{ drill_seed.stdout_lines[-1] }}) |
+          | Backup | tag DRILL, {{ drill_backup.stdout_lines | select('search', 'piece handle') | list | length }} piece(s) |
+          | Rows after backup (redo only) | {{ drill_rows_after }} ({{ drill_expected.stdout_lines[-1] }}) |
+          | Failure injected | `rm {{ drill_datafile }}`; buffer cache flushed; table read |
+          | Observed error | `{{ drill_failure.stdout_lines | select('search', 'ORA-') | list | join(' / ') }}` |
+          | Recovery | datafile OFFLINE; RMAN RESTORE DATAFILE + RECOVER DATAFILE; datafile ONLINE (PDB open throughout) |
+          | Verified after recovery | {{ drill_verify.stdout_lines | join(', ') }} |
+          | PDB state | {{ drill_pdb_state.stdout_lines | join(', ') }} |
+          | **RTO (read fails -> rows verified)** | **{{ drill_rto_seconds | float | round(1) }} s** |
+
+          ### RMAN restore/recover transcript (trimmed)
+
+          ```
+          {{ drill_restore.stdout_lines | select('search', drill_restore_filter) | list | join(drill_nl) }}
+          ```
+
+          RPO note: the rows inserted *after* the backup came back because they were in
+          archived/online redo, which RECOVER replayed. The RPO of this setup is therefore
+          bounded by redo that survives the failure, and in a total-loss scenario by the
+          archivelog backup interval ({{ rman_archivelog_oncalendar }}).
+      delegate_to: localhost
+      become: false
+
+    - name: Show the measured RTO
+      ansible.builtin.debug:
+        msg: "RTO {{ drill_rto_seconds | float | round(1) }} s; report docs/drills/restore-drill-{{ drill_stamp }}.md"

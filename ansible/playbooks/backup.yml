@@ -1,0 +1,46 @@
+---
+# Run one RMAN backup now through the same systemd unit the timers use, so logs,
+# state and the Prometheus textfile metric are produced exactly as in a scheduled run.
+#   make backup LEVEL=level0|level1|archivelog
+- name: Run an RMAN backup
+  hosts: oracle_db
+  become: true
+  vars:
+    backup_level: level0
+  tasks:
+    - name: Validate the requested level
+      ansible.builtin.assert:
+        that: backup_level in ['level0', 'level1', 'archivelog']
+        quiet: true
+
+    - name: Start the backup unit and wait for it, level {{ backup_level }}
+      ansible.builtin.systemd_service:
+        name: "oracle-rman-backup@{{ backup_level }}.service"
+        state: started
+      register: backup_unit
+      changed_when: true
+
+    - name: Read the wrapper's journal lines for this run
+      ansible.builtin.command:
+        argv: [journalctl, -u, "oracle-rman-backup@{{ backup_level }}.service", -n, "5", --no-pager, -o, cat]
+      register: backup_journal
+      changed_when: false
+
+    - name: Read the backup metric file
+      ansible.builtin.slurp:
+        src: "{{ node_exporter_textfile_dir }}/oracle_rman_backup.prom"
+      register: backup_prom
+
+    - name: Read the RMAN backup summary from the latest log
+      ansible.builtin.shell:
+        cmd: "set -o pipefail; ls -1t {{ rman_log_dir }}/rman-{{ backup_level }}-*.log | head -1 | xargs grep -A40 'List of Backups' | head -60"
+      register: backup_summary
+      changed_when: false
+      failed_when: false
+
+    - name: Show the result
+      ansible.builtin.debug:
+        msg:
+          journal: "{{ backup_journal.stdout_lines }}"
+          metrics: "{{ (backup_prom.content | b64decode).split('\n') | reject('match', '^#') | reject('equalto', '') | list }}"
+          summary: "{{ backup_summary.stdout_lines }}"
