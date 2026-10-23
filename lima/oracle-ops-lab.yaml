@@ -1,0 +1,34 @@
+---
+# Lima VM definition for the oracle-ops-lab.
+# Stands in for a VMware-hosted Oracle Linux VM. Apple Virtualization.framework (vz) on macOS.
+# Extra block devices are created with `limactl disk create` (see Makefile) and attached
+# unformatted so the Ansible storage role can build LVM + XFS on them, exactly as it would on
+# dedicated VMDKs in production.
+minimumLimaVersion: 2.0.0
+
+base:
+  - template:_images/oraclelinux-9
+
+vmType: vz
+arch: aarch64
+cpus: 4
+memory: 8GiB
+disk: 40GiB
+
+mountType: virtiofs
+mounts: []
+
+additionalDisks:
+  - name: ol-oradata
+    format: false
+  - name: ol-redo
+    format: false
+  - name: ol-fra
+    format: false
+
+containerd:
+  system: false
+  user: false
+
+# The guest cloud image ships with a serial console; nothing else is needed here. All
+# configuration happens over SSH via Ansible (see ansible/).

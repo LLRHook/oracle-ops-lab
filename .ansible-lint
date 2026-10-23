@@ -1,0 +1,21 @@
+---
+profile: production
+
+exclude_paths:
+  - .venv/
+  - .cache/
+  - ansible/collections/
+  - ansible/secrets/
+  - .github/
+  - monitoring/
+  - evidence/
+  - docs/
+
+kinds:
+  - playbook: "ansible/site.yml"
+  - playbook: "ansible/playbooks/*.yml"
+  - requirements: "ansible/requirements.yml"
+  - inventory: "ansible/inventory/*.yml"
+  - vars: "ansible/inventory/group_vars/*.yml"
+
+offline: true

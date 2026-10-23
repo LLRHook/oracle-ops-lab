@@ -1,0 +1,22 @@
+# Python / uv
+.venv/
+__pycache__/
+*.pyc
+
+# Downloaded artifacts (RPMs, tarballs) - never committed
+.cache/
+
+# Secrets generated at deploy time (see docs/DEEP_DIVE.md "Secrets")
+ansible/secrets/
+*.secret
+
+# Ansible runtime
+ansible/collections/
+*.retry
+.ansible/
+
+# Evidence scratch (raw captures); curated evidence lives in docs/EVIDENCE.md
+evidence/raw/
+
+# macOS
+.DS_Store
