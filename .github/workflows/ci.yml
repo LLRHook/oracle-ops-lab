@@ -1,0 +1,41 @@
+---
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    name: yamllint + ansible-lint (production profile)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.10.2"
+      - name: Install pinned tooling
+        run: uv sync --frozen
+      - name: Install pinned collections
+        run: cd ansible && ../.venv/bin/ansible-galaxy collection install -r requirements.yml -p collections
+      - name: Create a placeholder secrets file (never committed; needed to parse site.yml)
+        run: |
+          mkdir -p ansible/secrets
+          printf 'oracle_sys_password: x\noracle_exporter_password: x\n' > ansible/secrets/secrets.yml
+      - name: yamllint
+        run: .venv/bin/yamllint -s .
+      - name: ansible-lint
+        run: ANSIBLE_COLLECTIONS_PATH=ansible/collections .venv/bin/ansible-lint --offline
+
+  promtool:
+    name: promtool check + unit tests
+    runs-on: ubuntu-latest
+    container:
+      image: prom/prometheus:v3.15.1
+      options: --entrypoint ""
+    steps:
+      - uses: actions/checkout@v5
+      - name: Check rules
+        run: promtool check rules monitoring/prometheus/alerts.yml
+      - name: Unit tests
+        run: cd monitoring/prometheus && promtool test rules tests/alerts_test.yml

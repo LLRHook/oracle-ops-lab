@@ -1,0 +1,126 @@
+---
+# Alert rules for the Oracle tier. Series come from node_exporter (node_*, plus the
+# oracle_rman_* textfile metrics) and the Oracle metrics exporter (oracledb_*).
+groups:
+  - name: oracle-tier
+    rules:
+      - alert: DatabaseDown
+        expr: oracledb_up == 0 or absent(oracledb_up)
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Oracle database unreachable on {{ $labels.instance }}"
+          description: "The metrics exporter cannot connect to the database (oracledb_up == 0 or the series is missing)."
+          runbook: docs/runbooks/instance-wont-start-hugepages.md
+
+      - alert: PdbNotOpen
+        expr: oracledb_ops_pdb_open == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "PDB {{ $labels.pdb }} is not open READ WRITE"
+          runbook: docs/runbooks/restore-lost-datafile.md
+
+      - alert: BackupTooOld
+        # The key backup alert: not "did the job fail" but "how long since we last had a good copy".
+        # It catches failed runs, timers that never fired, hosts restored from an old template, etc.
+        expr: (time() - max by (sid) (oracle_rman_backup_last_success_timestamp_seconds{level=~"level0|level1"})) > 26 * 3600
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No successful level 0/1 RMAN backup of {{ $labels.sid }} in >26h"
+          runbook: docs/runbooks/backup-failed-or-too-old.md
+
+      - alert: ArchivelogBackupTooOld
+        expr: (time() - oracle_rman_backup_last_success_timestamp_seconds{level="archivelog"}) > 3 * 3600
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Archived redo of {{ $labels.sid }} not backed up for >3h (RPO at risk)"
+          runbook: docs/runbooks/backup-failed-or-too-old.md
+
+      - alert: BackupFailed
+        expr: oracle_rman_backup_last_status == 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Last RMAN {{ $labels.level }} run on {{ $labels.sid }} failed"
+          runbook: docs/runbooks/backup-failed-or-too-old.md
+
+      - alert: BackupMetricMissing
+        expr: absent(oracle_rman_backup_last_success_timestamp_seconds)
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Backup freshness metric missing (textfile collector or wrapper broken)"
+          runbook: docs/runbooks/backup-failed-or-too-old.md
+
+      - alert: FRAAlmostFull
+        # Net of reclaimable space: Oracle deletes obsolete/backed-up files itself when it must.
+        expr: oracledb_ops_fra_used_percent_net > 85
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "FRA {{ $labels.name }} at {{ $value | printf \"%.0f\" }}% net of reclaimable"
+          runbook: docs/runbooks/fra-full.md
+
+      - alert: FRAFull
+        expr: oracledb_ops_fra_used_percent_net > 95
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "FRA {{ $labels.name }} at {{ $value | printf \"%.0f\" }}%: archiver will stall and the database will hang"
+          runbook: docs/runbooks/fra-full.md
+
+      - alert: TablespaceAlmostFull
+        expr: oracledb_ops_tablespace_used_percent{tablespace!~"TEMP|UNDO.*"} > 85
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Tablespace {{ $labels.pdb }}/{{ $labels.tablespace }} at {{ $value | printf \"%.0f\" }}% of max size"
+          runbook: docs/runbooks/tablespace-almost-full.md
+
+      - alert: HugePagesNotInUse
+        # Huge pages reserved by the kernel but the running SGA is not in them. In this lab
+        # use_large_pages=ONLY makes this impossible while the instance is up; the rule still
+        # protects a fleet where a host was set to AUTO/FALSE by hand.
+        expr: |
+          oracledb_up == 1
+          and on (instance)
+          (
+            (node_memory_HugePages_Total - node_memory_HugePages_Free + node_memory_HugePages_Rsvd)
+              * node_memory_Hugepagesize_bytes
+            < on (instance) (oracledb_ops_sga_max_bytes * 0.9)
+          )
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "SGA on {{ $labels.instance }} is not backed by huge pages"
+          runbook: docs/runbooks/instance-wont-start-hugepages.md
+
+      - alert: HugePagesPoolMissing
+        expr: node_memory_HugePages_Total == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "No huge pages reserved on {{ $labels.instance }} (vm.nr_hugepages lost?)"
+          runbook: docs/runbooks/instance-wont-start-hugepages.md
+
+      - alert: NotInArchivelogMode
+        expr: oracledb_ops_db_archivelog == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Database on {{ $labels.instance }} is in NOARCHIVELOG mode: point-in-time recovery impossible"

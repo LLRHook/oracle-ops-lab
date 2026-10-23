@@ -1,0 +1,19 @@
+---
+# Example scrape configuration for a Prometheus that monitors the lab VM. Point it at the
+# forwarded ports (Lima forwards guest 9100/9161 to localhost on the Mac).
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - alerts.yml
+
+scrape_configs:
+  - job_name: node
+    static_configs:
+      - targets: ["host.docker.internal:9100"]
+        labels: {instance: oradb1}
+  - job_name: oracle
+    static_configs:
+      - targets: ["host.docker.internal:9161"]
+        labels: {instance: oradb1}

@@ -1,0 +1,214 @@
+---
+rule_files:
+  - ../alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  # --- DatabaseDown -----------------------------------------------------------
+  - interval: 1m
+    input_series:
+      - series: 'oracledb_up{instance="oradb1:9161",job="oracle"}'
+        values: "1 1 1 0 0 0 0"
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: DatabaseDown
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: DatabaseDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              instance: oradb1:9161
+              job: oracle
+            exp_annotations:
+              summary: "Oracle database unreachable on oradb1:9161"
+              description: "The metrics exporter cannot connect to the database (oracledb_up == 0 or the series is missing)."
+              runbook: docs/runbooks/instance-wont-start-hugepages.md
+
+  - interval: 1m
+    input_series: []
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: DatabaseDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "Oracle database unreachable on "
+              description: "The metrics exporter cannot connect to the database (oracledb_up == 0 or the series is missing)."
+              runbook: docs/runbooks/instance-wont-start-hugepages.md
+
+  # --- BackupTooOld -------------------------------------------------------------
+  # Last success at t=0 (epoch 0 relative to the test clock). At 25h no alert; at 27h it fires.
+  # Samples every minute: Prometheus only looks back 5 min for a sample, so hourly samples
+  # would make the alert flap between evaluations and never satisfy `for`.
+  - interval: 1m
+    input_series:
+      - series: 'oracle_rman_backup_last_success_timestamp_seconds{level="level0",sid="FREE",instance="oradb1:9100"}'
+        values: "0x1700"
+      - series: 'oracle_rman_backup_last_success_timestamp_seconds{level="archivelog",sid="FREE",instance="oradb1:9100"}'
+        values: "0+60x1700"
+    alert_rule_test:
+      - eval_time: 25h
+        alertname: BackupTooOld
+        exp_alerts: []
+      - eval_time: 27h
+        alertname: BackupTooOld
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              sid: FREE
+            exp_annotations:
+              summary: "No successful level 0/1 RMAN backup of FREE in >26h"
+              runbook: docs/runbooks/backup-failed-or-too-old.md
+      # a fresh archivelog backup does not satisfy the level0/1 requirement, but keeps its own alert quiet
+      - eval_time: 27h
+        alertname: ArchivelogBackupTooOld
+        exp_alerts: []
+
+  # A fresh level 1 keeps the alert quiet even when the level 0 is a week old.
+  - interval: 1m
+    input_series:
+      - series: 'oracle_rman_backup_last_success_timestamp_seconds{level="level0",sid="FREE",instance="oradb1:9100"}'
+        values: "0x10300"
+      - series: 'oracle_rman_backup_last_success_timestamp_seconds{level="level1",sid="FREE",instance="oradb1:9100"}'
+        values: "0+60x10300"
+    alert_rule_test:
+      - eval_time: 170h
+        alertname: BackupTooOld
+        exp_alerts: []
+
+  # --- BackupFailed / BackupMetricMissing ------------------------------------------
+  - interval: 1m
+    input_series:
+      - series: 'oracle_rman_backup_last_status{level="level1",sid="FREE",instance="oradb1:9100"}'
+        values: "1 1 0 0"
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: BackupFailed
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: BackupFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              level: level1
+              sid: FREE
+              instance: oradb1:9100
+            exp_annotations:
+              summary: "Last RMAN level1 run on FREE failed"
+              runbook: docs/runbooks/backup-failed-or-too-old.md
+
+  - interval: 5m
+    input_series: []
+    alert_rule_test:
+      - eval_time: 35m
+        alertname: BackupMetricMissing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "Backup freshness metric missing (textfile collector or wrapper broken)"
+              runbook: docs/runbooks/backup-failed-or-too-old.md
+
+  # --- FRA ---------------------------------------------------------------------
+  - interval: 1m
+    input_series:
+      - series: 'oracledb_ops_fra_used_percent_net{name="/u04/fra/FREE",instance="oradb1:9161"}'
+        values: "50 70 86x12 96x4"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: FRAAlmostFull
+        exp_alerts: []
+      - eval_time: 13m
+        alertname: FRAAlmostFull
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              name: /u04/fra/FREE
+              instance: oradb1:9161
+            exp_annotations:
+              summary: "FRA /u04/fra/FREE at 86% net of reclaimable"
+              runbook: docs/runbooks/fra-full.md
+      - eval_time: 17m
+        alertname: FRAFull
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              name: /u04/fra/FREE
+              instance: oradb1:9161
+            exp_annotations:
+              summary: "FRA /u04/fra/FREE at 96%: archiver will stall and the database will hang"
+              runbook: docs/runbooks/fra-full.md
+
+  # --- Tablespace ----------------------------------------------------------------
+  - interval: 1m
+    input_series:
+      - series: 'oracledb_ops_tablespace_used_percent{pdb="FREEPDB1",tablespace="USERS",instance="oradb1:9161"}'
+        values: "90x20"
+      - series: 'oracledb_ops_tablespace_used_percent{pdb="FREEPDB1",tablespace="TEMP",instance="oradb1:9161"}'
+        values: "99x20"
+      - series: 'oracledb_ops_tablespace_used_percent{pdb="FREEPDB1",tablespace="UNDOTBS1",instance="oradb1:9161"}'
+        values: "99x20"
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: TablespaceAlmostFull
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              pdb: FREEPDB1
+              tablespace: USERS
+              instance: oradb1:9161
+            exp_annotations:
+              summary: "Tablespace FREEPDB1/USERS at 90% of max size"
+              runbook: docs/runbooks/tablespace-almost-full.md
+
+  # --- HugePagesNotInUse -----------------------------------------------------------
+  # Pool of 784 x 2 MiB reserved; SGA 1.5 GiB. Case 1: 0 pages used -> fires. Case 2: 770 used -> quiet.
+  - interval: 1m
+    input_series:
+      - series: 'oracledb_up{instance="oradb1"}'
+        values: "1x15"
+      - series: 'oracledb_ops_sga_max_bytes{instance="oradb1"}'
+        values: "1610612736x15"
+      - series: 'node_memory_HugePages_Total{instance="oradb1"}'
+        values: "784x15"
+      - series: 'node_memory_HugePages_Free{instance="oradb1"}'
+        values: "784x15"
+      - series: 'node_memory_HugePages_Rsvd{instance="oradb1"}'
+        values: "0x15"
+      - series: 'node_memory_Hugepagesize_bytes{instance="oradb1"}'
+        values: "2097152x15"
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: HugePagesNotInUse
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: oradb1
+            exp_annotations:
+              summary: "SGA on oradb1 is not backed by huge pages"
+              runbook: docs/runbooks/instance-wont-start-hugepages.md
+
+  - interval: 1m
+    input_series:
+      - series: 'oracledb_up{instance="oradb1"}'
+        values: "1x15"
+      - series: 'oracledb_ops_sga_max_bytes{instance="oradb1"}'
+        values: "1610612736x15"
+      - series: 'node_memory_HugePages_Total{instance="oradb1"}'
+        values: "784x15"
+      - series: 'node_memory_HugePages_Free{instance="oradb1"}'
+        values: "14x15"
+      - series: 'node_memory_HugePages_Rsvd{instance="oradb1"}'
+        values: "0x15"
+      - series: 'node_memory_Hugepagesize_bytes{instance="oradb1"}'
+        values: "2097152x15"
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: HugePagesNotInUse
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: HugePagesPoolMissing
+        exp_alerts: []
