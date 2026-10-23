@@ -21,7 +21,11 @@ jobs:
       - name: Create a placeholder secrets file (never committed; needed to parse site.yml)
         run: |
           mkdir -p ansible/secrets
-          printf 'oracle_sys_password: x\noracle_exporter_password: x\n' > ansible/secrets/secrets.yml
+          cat > ansible/secrets/secrets.yml <<'EOF'
+          ---
+          oracle_sys_password: x
+          oracle_exporter_password: x
+          EOF
       - name: yamllint
         run: .venv/bin/yamllint -s .
       - name: ansible-lint
